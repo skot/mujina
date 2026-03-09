@@ -27,10 +27,31 @@ pub struct BoardState {
     pub name: String,
     pub model: String,
     pub serial: Option<String>,
+    /// Configured board operating frequency in MHz, if known.
+    pub frequency_mhz: Option<f32>,
+    /// Number of hashboard channels exposed by this board, if known.
+    pub hashboard_count: Option<u8>,
+    /// Number of hashboard channels currently active in Mujina, if known.
+    pub active_hashboard_count: Option<u8>,
     pub fans: Vec<Fan>,
+    pub hashboards: Vec<HashboardState>,
     pub temperatures: Vec<TemperatureSensor>,
     pub powers: Vec<PowerMeasurement>,
     pub threads: Vec<ThreadState>,
+}
+
+/// Per-hashboard connectivity and activity state.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct HashboardState {
+    pub index: u8,
+    /// Serial port assigned to this hashboard data channel, if known.
+    pub serial_port: Option<String>,
+    /// Whether the bridge currently detects a hashboard on this channel.
+    pub is_present: bool,
+    /// Whether Mujina has started a worker thread for this channel.
+    pub is_active: bool,
+    /// Hashrate in hashes per second for this hashboard.
+    pub hashrate: u64,
 }
 
 /// Fan status.

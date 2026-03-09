@@ -1,13 +1,15 @@
 //! S19j Pro hashboard support via Bitcrane v3.
 //!
-//! The S19j Pro is a hashboard with 126 BM1362 ASIC chips, communicating via
-//! USB using the bitcrane protocol. Power is provided by an APW12 PSU controlled
-//! via bit-banged I2C.
+//! A Bitcrane v3 bridge exposes one management channel plus three independent
+//! ASIC UART channels for three Antminer S19j Pro hashboards. Mujina models
+//! that as a single board with shared power and cooling, and one BM13xx thread
+//! per populated hashboard channel.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use tokio::sync::{Mutex, watch};
 use tokio_serial::SerialPortBuilderExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -17,7 +19,10 @@ use super::{
     pattern::{BoardPattern, Match, StringMatch},
 };
 use crate::{
-    api_client::types::{BoardState, Fan, MinerState, TemperatureSensor},
+    api_client::types::{
+        BoardState, Fan, HashboardState, MinerState, PowerMeasurement, TemperatureSensor,
+        ThreadState,
+    },
     asic::{
         bm13xx::{
             self,
@@ -25,12 +30,12 @@ use crate::{
             chip_config, thread_v2,
             topology::TopologySpec,
         },
-        hash_thread::{AsicEnable, HashThread},
+        hash_thread::{AsicEnable, HashThread, HashThreadStatus},
     },
     error::Error,
     hw_trait::gpio::{GpioPin, PinValue},
     mgmt_protocol::{
-        ControlChannel, Apw12Psu,
+        Apw12Psu, ControlChannel,
         bitcrane::{
             display::BitcraneDisplay,
             fan::{self, BitcraneFan},
@@ -40,21 +45,34 @@ use crate::{
     },
     peripheral::tmp75::{self, Tmp75},
     tracing::prelude::*,
-    transport::{
-        UsbDeviceInfo,
-        serial::{SerialControl, SerialStream},
-    },
+    transport::{UsbDeviceInfo, serial::SerialStream},
 };
 
-// Register this board type with the inventory system
+const S19J_PRO_TARGET_FREQ_MHZ: f32 = 500.0;
+const APW12_POWER_RAIL_NAME: &str = "APW12";
+const HASHBOARD_COUNT: usize = 3;
+
+const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
+const DISPLAY_UPDATE_INTERVAL: u32 = 5;
+
+const FAN_MIN_PERCENT: u8 = 45;
+const FAN_FAILSAFE_PERCENT: u8 = 80;
+const FAN_MAX_PERCENT: u8 = 100;
+const FAN_TARGET_TEMP_C: f32 = 62.0;
+const FAN_FULL_SPEED_TEMP_C: f32 = 68.0;
+const FAN_MAX_TEMP_C: f32 = 70.0;
+const FAN_PID_KP: f32 = 6.0;
+const FAN_PID_KI: f32 = 0.35;
+const FAN_PID_KD: f32 = 3.0;
+
 inventory::submit! {
     BoardDescriptor {
         pattern: BoardPattern {
             vid: Match::Any,
             pid: Match::Any,
             bcd_device: Match::Any,
-            manufacturer: Match::Specific(StringMatch::Exact("256F")),
-            product: Match::Specific(StringMatch::Exact("bitcrane_S19jpro")),
+            manufacturer: Match::Specific(StringMatch::Regex("^(256F|OSMU)$")),
+            product: Match::Specific(StringMatch::Regex("^(bitcrane_S19jpro|bitcrane3)$")),
             serial_pattern: Match::Any,
         },
         name: "S19j Pro",
@@ -62,97 +80,127 @@ inventory::submit! {
     }
 }
 
-/// S19j Pro hashboard.
+#[derive(Clone)]
+struct S19jProHashboard {
+    index: u8,
+    data_port_path: String,
+    reset_pin: Option<BitcraneGpioPinHandle>,
+    plug_pin: Option<BitcraneGpioPinHandle>,
+    temp_sensors: Option<(Tmp75, Tmp75)>,
+    is_present: bool,
+    is_active: bool,
+}
+
+impl S19jProHashboard {
+    fn state(&self, hashrate: u64) -> HashboardState {
+        HashboardState {
+            index: self.index,
+            serial_port: Some(self.data_port_path.clone()),
+            is_present: self.is_present,
+            is_active: self.is_active,
+            hashrate,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct S19jProThreadMonitor {
+    index: u8,
+    name: String,
+    status: Arc<RwLock<HashThreadStatus>>,
+}
+
+/// S19j Pro board with shared PSU/fans and up to three hashboard channels.
 pub struct S19jPro {
     device_info: UsbDeviceInfo,
-    data_port_path: String,
-    /// Control channel for board management (bitcrane protocol).
+    hashboards: Vec<S19jProHashboard>,
+    thread_monitors: Vec<S19jProThreadMonitor>,
     control_channel: ControlChannel,
-    /// Control handle for data channel (for baud rate changes).
-    data_control: Option<SerialControl>,
-    /// ASIC reset pin (RST0, active-low).
-    reset_pin: Option<BitcraneGpioPinHandle>,
-    /// APW12 PSU controller.
     psu: Option<Arc<Mutex<Apw12Psu>>>,
-    /// TMP75 temperature sensors (2 per hashboard).
-    temp_sensors: Option<(Tmp75, Tmp75)>,
-
-    /// Channel for publishing board state to the API server.
     state_tx: watch::Sender<BoardState>,
-    /// Receiver for miner state (hashrate for OLED display).
     miner_state_rx: Option<watch::Receiver<MinerState>>,
 }
 
 impl S19jPro {
-    /// Create a new S19j Pro board instance.
     pub fn new(
         device_info: UsbDeviceInfo,
         control_channel: ControlChannel,
-        data_port_path: String,
+        data_port_paths: Vec<String>,
         state_tx: watch::Sender<BoardState>,
     ) -> Self {
+        let hashboards = data_port_paths
+            .into_iter()
+            .enumerate()
+            .map(|(index, data_port_path)| S19jProHashboard {
+                index: index as u8,
+                data_port_path,
+                reset_pin: None,
+                plug_pin: None,
+                temp_sensors: None,
+                is_present: false,
+                is_active: false,
+            })
+            .collect();
+
         Self {
             device_info,
-            data_port_path,
+            hashboards,
+            thread_monitors: Vec::new(),
             control_channel,
-            data_control: None,
-            reset_pin: None,
             psu: None,
-            temp_sensors: None,
             state_tx,
             miner_state_rx: None,
         }
     }
 
-    /// Initialize the board hardware.
-    ///
-    /// Sets up GPIO pins, initializes APW12 PSU, and holds ASICs in reset until mining starts.
     pub async fn initialize(&mut self) -> Result<(), BoardError> {
-        // Get GPIO controller using bitcrane protocol
         let gpio = BitcraneGpioController::new(self.control_channel.clone());
+        let i2c = BitcraneI2c::new(self.control_channel.clone());
 
-        // Get RST0 pin for first hashboard
-        let mut reset_pin = gpio.pin(BitcraneGpioPin::Rst0);
+        for hashboard in &mut self.hashboards {
+            let mut reset_pin = gpio.pin(reset_pin_for_index(hashboard.index));
+            reset_pin.write(PinValue::Low).await.map_err(|e| {
+                BoardError::InitializationFailed(format!(
+                    "Failed to assert reset for HB{}: {}",
+                    hashboard.index, e
+                ))
+            })?;
 
-        // Initialize to safe state: chips in reset (RST0 low = reset asserted)
-        debug!("Initializing S19j Pro: chips in reset");
-        reset_pin.write(PinValue::Low).await.map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to assert reset: {}", e))
-        })?;
+            let mut plug_pin = gpio.pin(plug_pin_for_index(hashboard.index));
+            hashboard.is_present = match plug_pin.read().await {
+                Ok(PinValue::High) => true,
+                Ok(PinValue::Low) => false,
+                Err(e) => {
+                    warn!(hashboard = hashboard.index, error = %e, "Plug detect failed; assuming present");
+                    true
+                }
+            };
 
-        // Store GPIO pin for later use
-        self.reset_pin = Some(reset_pin);
+            hashboard.reset_pin = Some(reset_pin);
+            hashboard.plug_pin = Some(plug_pin);
+            hashboard.temp_sensors =
+                Some(tmp75::sensors_for_hashboard(i2c.clone(), hashboard.index));
+        }
 
-        // Initialize APW12 PSU
         debug!("Initializing APW12 PSU");
         let mut psu = Apw12Psu::new(self.control_channel.clone());
-
-        // Enable PSU
         psu.set_enabled(true).await.map_err(|e| {
             BoardError::InitializationFailed(format!("Failed to enable PSU: {}", e))
         })?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // Wait for PSU to power up
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-        // Disable watchdog (0x00 = disabled)
         psu.config_watchdog(0x00).await.map_err(|e| {
             BoardError::InitializationFailed(format!("Failed to configure PSU watchdog: {}", e))
         })?;
 
-        // Set initial voltage for BM1362 chain
         const DEFAULT_VOUT: f32 = 12.6;
         psu.set_voltage(DEFAULT_VOUT).await.map_err(|e| {
             BoardError::InitializationFailed(format!("Failed to set PSU voltage: {}", e))
         })?;
 
         info!("APW12 PSU enabled, voltage set to {}V", DEFAULT_VOUT);
+        tokio::time::sleep(Duration::from_millis(2000)).await;
 
-        // Wait for voltage to stabilize before chip enumeration
-        // Longer delay needed for 126-chip chain to fully power up
-        tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
-
-        // Verify voltage
         match psu.measure_voltage().await {
             Ok(v) => info!("APW12 measured voltage: {:.2}V", v),
             Err(e) => warn!("Failed to measure PSU voltage: {}", e),
@@ -160,23 +208,57 @@ impl S19jPro {
 
         self.psu = Some(Arc::new(Mutex::new(psu)));
 
-        // Initialize TMP75 temperature sensors for hashboard 0
-        let i2c = BitcraneI2c::new(self.control_channel.clone());
-        let (temp0, temp1) = tmp75::sensors_for_hashboard(i2c, 0);
-        self.temp_sensors = Some((temp0.clone(), temp1.clone()));
-
-        // Initialize fans and set to 50% speed
         let fans = fan::all_fans(self.control_channel.clone());
-        const DEFAULT_FAN_SPEED: u8 = 50;
         for fan in &fans {
-            if let Err(e) = fan.set_speed(DEFAULT_FAN_SPEED).await {
-                warn!(fan = %fan.name(), error = %e, "Failed to set fan speed");
+            if let Err(e) = fan.set_speed(FAN_FAILSAFE_PERCENT).await {
+                warn!(fan = %fan.name(), error = %e, "Failed to set initial fan speed");
             }
         }
-        info!("Fans initialized at {}% speed", DEFAULT_FAN_SPEED);
+        info!("Fans initialized at {}% speed", FAN_FAILSAFE_PERCENT);
 
+        self.publish_hashboard_state();
         info!("S19j Pro initialized successfully");
         Ok(())
+    }
+
+    fn publish_hashboard_state(&self) {
+        let hashboards: Vec<HashboardState> = self.hashboard_states();
+        let active_hashboard_count = hashboards
+            .iter()
+            .filter(|hashboard| hashboard.is_active)
+            .count() as u8;
+
+        self.state_tx.send_modify(|state| {
+            state.frequency_mhz = Some(S19J_PRO_TARGET_FREQ_MHZ);
+            state.hashboard_count = Some(hashboard_count_u8(hashboards.len()));
+            state.active_hashboard_count = Some(active_hashboard_count);
+            state.hashboards = hashboards.clone();
+        });
+    }
+
+    fn hashboard_states(&self) -> Vec<HashboardState> {
+        let hashboard_hashrates = self.hashboard_hashrates();
+        self.hashboards
+            .iter()
+            .map(|hashboard| {
+                let hashrate = hashboard_hashrates
+                    .iter()
+                    .find(|(index, _)| *index == hashboard.index)
+                    .map(|(_, hashrate)| *hashrate)
+                    .unwrap_or(0);
+                hashboard.state(hashrate)
+            })
+            .collect()
+    }
+
+    fn hashboard_hashrates(&self) -> Vec<(u8, u64)> {
+        self.thread_monitors
+            .iter()
+            .map(|monitor| {
+                let status = monitor.status.read();
+                (monitor.index, effective_hashrate(&status))
+            })
+            .collect()
     }
 }
 
@@ -191,98 +273,157 @@ impl Board for S19jPro {
     }
 
     async fn shutdown(&mut self) -> Result<(), BoardError> {
-        // Set all fans to 0%
-        for (i, fan) in fan::all_fans(self.control_channel.clone()).into_iter().enumerate() {
+        for fan in fan::all_fans(self.control_channel.clone()) {
             if let Err(e) = fan.set_speed(0).await {
-                warn!(fan = i, "Failed to set fan to 0% on shutdown: {}", e);
-            }
-        }
-        info!("Fans set to 0%");
-
-        // Assert reset to stop ASICs
-        if let Some(ref mut reset_pin) = self.reset_pin {
-            if let Err(e) = reset_pin.write(PinValue::Low).await {
-                warn!("Failed to assert reset on shutdown: {}", e);
+                warn!(fan = %fan.name(), error = %e, "Failed to set fan to 0% on shutdown");
             }
         }
 
-        // Disable PSU
-        if let Some(ref psu) = self.psu {
+        for hashboard in &mut self.hashboards {
+            hashboard.is_active = false;
+            if let Some(reset_pin) = &mut hashboard.reset_pin {
+                if let Err(e) = reset_pin.write(PinValue::Low).await {
+                    warn!(hashboard = hashboard.index, error = %e, "Failed to assert reset on shutdown");
+                }
+            }
+        }
+
+        if let Some(psu) = &self.psu {
             if let Err(e) = psu.lock().await.set_enabled(false).await {
                 warn!("Failed to disable PSU on shutdown: {}", e);
             }
         }
 
+        self.publish_hashboard_state();
         info!("S19j Pro shutdown complete");
         Ok(())
     }
 
     async fn create_hash_threads(&mut self) -> Result<Vec<Box<dyn HashThread>>, BoardError> {
-        // Take GPIO pin from initialization
-        let reset_pin = self.reset_pin.take().ok_or_else(|| {
-            BoardError::InitializationFailed("Reset pin not initialized".to_string())
-        })?;
+        let mut threads: Vec<Box<dyn HashThread>> = Vec::new();
+        let initialization_lock = Arc::new(Mutex::new(()));
 
-        // Open data port
-        let data_stream = SerialStream::new(&self.data_port_path, 115200).map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to open data port: {}", e))
-        })?;
-        let (data_reader, data_writer, data_control) = data_stream.split();
+        for hashboard in &mut self.hashboards {
+            if !hashboard.is_present {
+                info!(
+                    hashboard = hashboard.index,
+                    "Skipping unpopulated hashboard channel"
+                );
+                continue;
+            }
 
-        // Flush any stale data in the serial buffer before enumeration
-        data_control.flush_input().map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to flush serial buffer: {}", e))
-        })?;
+            let Some(reset_pin) = hashboard.reset_pin.clone() else {
+                return Err(BoardError::InitializationFailed(format!(
+                    "Reset pin not initialized for HB{}",
+                    hashboard.index
+                )));
+            };
 
-        self.data_control = Some(data_control);
+            let data_stream = match SerialStream::new(&hashboard.data_port_path, 115200) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!(
+                        hashboard = hashboard.index,
+                        port = %hashboard.data_port_path,
+                        error = %e,
+                        "Failed to open data port"
+                    );
+                    continue;
+                }
+            };
+            let (data_reader, data_writer, data_control) = data_stream.split();
 
-        // Create framed reader/writer for BM13xx protocol
-        let chip_rx = FramedRead::new(data_reader, bm13xx::FrameCodec);
-        let chip_tx = FramedWrite::new(data_writer, bm13xx::FrameCodec);
+            if let Err(e) = data_control.flush_input() {
+                warn!(
+                    hashboard = hashboard.index,
+                    port = %hashboard.data_port_path,
+                    error = %e,
+                    "Failed to flush serial buffer"
+                );
+                continue;
+            }
 
-        // Build thread name from board model and serial
-        let thread_name = match &self.device_info.serial_number {
-            Some(serial) => format!("S19jPro-{}", &serial[..8.min(serial.len())]),
-            None => "S19jPro".to_string(),
-        };
+            let chip_rx = FramedRead::new(data_reader, bm13xx::FrameCodec);
+            let chip_tx = FramedWrite::new(data_writer, bm13xx::FrameCodec);
 
-        // Build chain configuration for S19j Pro: 42 series domains × 3 chips = 126 BM1362 chips
-        // Use APW12 PSU for voltage regulation
-        let voltage_regulator: Option<Arc<Mutex<dyn VoltageRegulator + Send>>> =
-            self.psu.as_ref().map(|psu| {
-                Arc::clone(psu) as Arc<Mutex<dyn VoltageRegulator + Send>>
-            });
+            let serial_prefix = self
+                .device_info
+                .serial_number
+                .as_deref()
+                .unwrap_or("unknown");
+            let thread_name = format!("S19jPro-{}-HB{}", serial_prefix, hashboard.index);
 
-        let config = ChainConfig {
-            name: thread_name,
-            // S19j Pro: 42 series domains, 3 chips per domain (126 total)
-            topology: TopologySpec::uniform_domains(42, 3, false),
-            chip_config: chip_config::bm1362(),
-            peripherals: ChainPeripherals {
-                asic_enable: Arc::new(Mutex::new(S19jProAsicEnable { reset_pin })),
-                voltage_regulator,
-            },
-        };
+            let voltage_regulator: Option<Arc<Mutex<dyn VoltageRegulator + Send>>> = self
+                .psu
+                .as_ref()
+                .map(|psu| Arc::clone(psu) as Arc<Mutex<dyn VoltageRegulator + Send>>);
 
-        // Create the hash thread
-        let thread = thread_v2::BM13xxThread::new(chip_rx, chip_tx, config).map_err(|e| {
-            BoardError::InitializationFailed(format!("Failed to create hash thread: {}", e))
-        })?;
+            let config = ChainConfig {
+                name: thread_name,
+                topology: TopologySpec::uniform_domains(42, 3, false),
+                chip_config: chip_config::bm1362(),
+                peripherals: ChainPeripherals {
+                    asic_enable: Arc::new(Mutex::new(S19jProAsicEnable { reset_pin })),
+                    voltage_regulator,
+                    initialization_lock: Arc::clone(&initialization_lock),
+                },
+            };
 
-        // Spawn telemetry task now that miner_state_rx is available
-        // (set_miner_state_rx is called by backplane before create_hash_threads)
-        let (temp0, temp1) = self.temp_sensors.take().ok_or_else(|| {
-            BoardError::InitializationFailed("Temperature sensors not initialized".to_string())
-        })?;
+            match thread_v2::BM13xxThread::new(chip_rx, chip_tx, config) {
+                Ok(thread) => {
+                    self.thread_monitors.push(S19jProThreadMonitor {
+                        index: hashboard.index,
+                        name: thread.name().to_string(),
+                        status: thread.status_handle(),
+                    });
+                    hashboard.is_active = true;
+                    info!(
+                        hashboard = hashboard.index,
+                        port = %hashboard.data_port_path,
+                        "Started S19j Pro hashboard thread"
+                    );
+                    threads.push(Box::new(thread));
+                }
+                Err(e) => {
+                    warn!(
+                        hashboard = hashboard.index,
+                        port = %hashboard.data_port_path,
+                        error = %e,
+                        "Failed to create S19j Pro hashboard thread"
+                    );
+                }
+            }
+        }
+
+        if threads.is_empty() {
+            return Err(BoardError::InitializationFailed(
+                "No populated S19j Pro hashboards could be started".to_string(),
+            ));
+        }
+
+        self.publish_hashboard_state();
+
+        let telemetry_hardware = self.hashboards.clone();
+        let thread_monitors = self.thread_monitors.clone();
+        let psu = self.psu.as_ref().map(Arc::clone);
         let fans = fan::all_fans(self.control_channel.clone());
         let display = BitcraneDisplay::new(self.control_channel.clone());
         let state_tx = self.state_tx.clone();
         let miner_state_rx = self.miner_state_rx.clone();
         tokio::spawn(async move {
-            telemetry_task(temp0, temp1, fans, display, state_tx, miner_state_rx).await;
+            telemetry_task(
+                telemetry_hardware,
+                thread_monitors,
+                psu,
+                fans,
+                display,
+                state_tx,
+                miner_state_rx,
+            )
+            .await;
         });
 
-        Ok(vec![Box::new(thread)])
+        Ok(threads)
     }
 
     fn set_miner_state_rx(&mut self, rx: watch::Receiver<MinerState>) {
@@ -290,45 +431,117 @@ impl Board for S19jPro {
     }
 }
 
-/// Telemetry task that periodically reads temperature sensors and fan RPMs.
-///
-/// Runs indefinitely, updating state_tx with readings every 2 seconds.
-/// Also updates the OLED display with hashrate every 10 seconds.
 async fn telemetry_task(
-    temp0: Tmp75,
-    temp1: Tmp75,
+    mut hashboards: Vec<S19jProHashboard>,
+    thread_monitors: Vec<S19jProThreadMonitor>,
+    psu: Option<Arc<Mutex<Apw12Psu>>>,
     fans: [BitcraneFan; 4],
     display: BitcraneDisplay,
     state_tx: watch::Sender<BoardState>,
     miner_state_rx: Option<watch::Receiver<MinerState>>,
 ) {
-    const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
-    const DISPLAY_UPDATE_INTERVAL: u32 = 5; // Update display every N telemetry cycles
-
     let mut cycle_count: u32 = 0;
+    let mut pid = FanPidController::default();
+    let mut fan_target_percent = FAN_FAILSAFE_PERCENT;
 
     loop {
-        // Read both temperature sensors
-        let temp0_result = temp0.read_temperature().await;
-        let temp1_result = temp1.read_temperature().await;
+        let mut temperatures: Vec<TemperatureSensor> = Vec::with_capacity(hashboards.len() * 2);
+        let mut hashboard_states: Vec<HashboardState> = Vec::with_capacity(hashboards.len());
+        let mut thread_states: Vec<ThreadState> = Vec::with_capacity(thread_monitors.len());
+        let mut max_temp_c: Option<f32> = None;
+        let hashrates_by_index: Vec<(u8, bool, u64)> = thread_monitors
+            .iter()
+            .map(|monitor| {
+                let status = monitor.status.read();
+                let hashrate = effective_hashrate(&status);
+                (monitor.index, status.is_active, hashrate)
+            })
+            .collect();
 
-        // Build temperature sensor readings
-        let temperatures = vec![
-            TemperatureSensor {
-                name: temp0.name().to_string(),
-                temperature_c: temp0_result
+        for monitor in &thread_monitors {
+            let status = monitor.status.read();
+            let hashrate = effective_hashrate(&status);
+            thread_states.push(ThreadState {
+                name: monitor.name.clone(),
+                hashrate,
+                is_active: status.is_active,
+            });
+        }
+
+        for hashboard in &mut hashboards {
+            if let Some(plug_pin) = &mut hashboard.plug_pin {
+                hashboard.is_present = match plug_pin.read().await {
+                    Ok(PinValue::High) => true,
+                    Ok(PinValue::Low) => false,
+                    Err(e) => {
+                        debug!(hashboard = hashboard.index, error = %e, "Plug detect read failed");
+                        hashboard.is_present
+                    }
+                };
+            }
+
+            if let Some((temp0, temp1)) = &hashboard.temp_sensors {
+                let temp0_value = temp0
+                    .read_temperature()
+                    .await
                     .inspect_err(|e| debug!(sensor = %temp0.name(), error = %e, "Temp read failed"))
-                    .ok(),
-            },
-            TemperatureSensor {
-                name: temp1.name().to_string(),
-                temperature_c: temp1_result
+                    .ok();
+                let temp1_value = temp1
+                    .read_temperature()
+                    .await
                     .inspect_err(|e| debug!(sensor = %temp1.name(), error = %e, "Temp read failed"))
-                    .ok(),
-            },
-        ];
+                    .ok();
 
-        // Read all fan RPMs
+                if let Some(temp) = temp0_value {
+                    max_temp_c = Some(max_temp_c.map_or(temp, |max| max.max(temp)));
+                }
+                if let Some(temp) = temp1_value {
+                    max_temp_c = Some(max_temp_c.map_or(temp, |max| max.max(temp)));
+                }
+
+                temperatures.push(TemperatureSensor {
+                    name: temp0.name().to_string(),
+                    temperature_c: temp0_value,
+                });
+                temperatures.push(TemperatureSensor {
+                    name: temp1.name().to_string(),
+                    temperature_c: temp1_value,
+                });
+            }
+
+            let (is_active, hashrate) = hashrates_by_index
+                .iter()
+                .find(|(index, _, _)| *index == hashboard.index)
+                .map(|(_, is_active, hashrate)| (*is_active, *hashrate))
+                .unwrap_or((false, 0));
+            hashboard.is_active = is_active;
+            hashboard_states.push(hashboard.state(hashrate));
+        }
+
+        let next_target_percent = pid.next_target_percent(max_temp_c, TELEMETRY_INTERVAL);
+        if next_target_percent != fan_target_percent {
+            for fan in &fans {
+                if let Err(e) = fan.set_speed(next_target_percent).await {
+                    warn!(fan = %fan.name(), error = %e, "Failed to set fan speed");
+                }
+            }
+            debug!(
+                target_percent = next_target_percent,
+                max_temp_c, "Updated S19j Pro fan target"
+            );
+            fan_target_percent = next_target_percent;
+        }
+
+        if let Some(max_temp_c) = max_temp_c {
+            if max_temp_c >= FAN_MAX_TEMP_C {
+                warn!(
+                    max_temp_c,
+                    target_percent = fan_target_percent,
+                    "S19j Pro temperature reached the 70C ceiling"
+                );
+            }
+        }
+
         let mut fan_states = Vec::with_capacity(4);
         for fan in &fans {
             let rpm_result = fan.read_rpm().await;
@@ -337,22 +550,50 @@ async fn telemetry_task(
                 rpm: rpm_result
                     .inspect_err(|e| debug!(fan = %fan.name(), error = %e, "Fan RPM read failed"))
                     .ok(),
-                percent: None, // We don't track current duty cycle yet
-                target_percent: Some(50), // We set 50% at init
+                percent: None,
+                target_percent: Some(fan_target_percent),
             });
         }
 
-        // Update board state
+        let voltage_v = if let Some(psu) = &psu {
+            let mut psu = psu.lock().await;
+            psu.measure_voltage()
+                .await
+                .inspect_err(
+                    |e| debug!(rail = APW12_POWER_RAIL_NAME, error = %e, "Voltage read failed"),
+                )
+                .ok()
+        } else {
+            None
+        };
+
+        let powers = vec![PowerMeasurement {
+            name: APW12_POWER_RAIL_NAME.to_string(),
+            voltage_v,
+            current_a: None,
+            power_w: None,
+        }];
+
+        let active_hashboard_count = hashboard_states
+            .iter()
+            .filter(|hashboard| hashboard.is_active)
+            .count() as u8;
+
         state_tx.send_modify(|state| {
-            state.temperatures = temperatures;
-            state.fans = fan_states;
+            state.frequency_mhz = Some(S19J_PRO_TARGET_FREQ_MHZ);
+            state.hashboard_count = Some(hashboard_count_u8(hashboard_states.len()));
+            state.active_hashboard_count = Some(active_hashboard_count);
+            state.hashboards = hashboard_states.clone();
+            state.temperatures = temperatures.clone();
+            state.fans = fan_states.clone();
+            state.powers = powers.clone();
+            state.threads = thread_states.clone();
         });
 
-        // Update OLED display periodically with actual hashrate from scheduler
         if cycle_count % DISPLAY_UPDATE_INTERVAL == 0 {
             let hashrate_gh = miner_state_rx
                 .as_ref()
-                .map(|rx| rx.borrow().hashrate as f64 / 1_000_000_000.0) // H/s to GH/s
+                .map(|rx| rx.borrow().hashrate as f64 / 1_000_000_000.0)
                 .unwrap_or(0.0);
 
             if let Err(e) = display.display_hashrate(hashrate_gh).await {
@@ -365,10 +606,46 @@ async fn telemetry_task(
     }
 }
 
-/// Adapter implementing `AsicEnable` for S19j Pro's GPIO-based reset control.
-///
-/// Controls RST0 pin via bitcrane protocol (active-low reset for ASIC chips).
-/// Power is handled externally.
+#[derive(Default)]
+struct FanPidController {
+    integral: f32,
+    previous_error: Option<f32>,
+}
+
+impl FanPidController {
+    fn next_target_percent(&mut self, max_temp_c: Option<f32>, dt: Duration) -> u8 {
+        let Some(max_temp_c) = max_temp_c else {
+            self.integral = 0.0;
+            self.previous_error = None;
+            return FAN_FAILSAFE_PERCENT;
+        };
+
+        if max_temp_c >= FAN_FULL_SPEED_TEMP_C {
+            self.integral = 0.0;
+            self.previous_error = Some(max_temp_c - FAN_TARGET_TEMP_C);
+            return FAN_MAX_PERCENT;
+        }
+
+        let dt_secs = dt.as_secs_f32().max(1.0);
+        let error = max_temp_c - FAN_TARGET_TEMP_C;
+        self.integral = (self.integral + error * dt_secs).clamp(0.0, 40.0);
+        let derivative = self
+            .previous_error
+            .map(|previous_error| (error - previous_error) / dt_secs)
+            .unwrap_or(0.0);
+        self.previous_error = Some(error);
+
+        let output = FAN_MIN_PERCENT as f32
+            + FAN_PID_KP * error.max(0.0)
+            + FAN_PID_KI * self.integral
+            + FAN_PID_KD * derivative.max(0.0);
+
+        output
+            .round()
+            .clamp(FAN_MIN_PERCENT as f32, FAN_MAX_PERCENT as f32) as u8
+    }
+}
+
 struct S19jProAsicEnable {
     reset_pin: BitcraneGpioPinHandle,
 }
@@ -376,21 +653,15 @@ struct S19jProAsicEnable {
 #[async_trait]
 impl AsicEnable for S19jProAsicEnable {
     async fn enable(&mut self) -> anyhow::Result<()> {
-        // Release reset (RST0 is active-low, so High = running)
         self.reset_pin
             .write(PinValue::High)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to release reset: {}", e))?;
-
-        // Wait for all 126 chips (42 series domains × 3 chips) to come out of
-        // reset and stabilize before enumeration begins
-        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-
+        tokio::time::sleep(Duration::from_millis(2000)).await;
         Ok(())
     }
 
     async fn disable(&mut self) -> anyhow::Result<()> {
-        // Assert reset (RST0 low = reset asserted)
         self.reset_pin
             .write(PinValue::Low)
             .await
@@ -398,16 +669,12 @@ impl AsicEnable for S19jProAsicEnable {
     }
 }
 
-// Factory function to create S19j Pro board from USB device info
 async fn create_from_usb(
     device: UsbDeviceInfo,
 ) -> crate::error::Result<(Box<dyn Board + Send>, super::BoardRegistration)> {
-    // Get serial ports
     let serial_ports = device.serial_ports()?;
 
-    // S19j Pro uses 4 serial ports: control + 3 hashboard data channels
-    // For now, just use the first hashboard (ports 0=control, 1=data)
-    if serial_ports.len() != 4 {
+    if serial_ports.len() != HASHBOARD_COUNT + 1 {
         return Err(Error::Hardware(format!(
             "S19j Pro requires exactly 4 serial ports, found {}",
             serial_ports.len()
@@ -415,34 +682,44 @@ async fn create_from_usb(
     }
 
     let control_port_path = serial_ports[0].clone();
-    let data_port_path = serial_ports[1].clone(); // First hashboard
+    let data_port_paths = serial_ports[1..].to_vec();
 
     debug!(
         serial = ?device.serial_number,
         control = %control_port_path,
-        data = %data_port_path,
+        data_ports = ?data_port_paths,
         "S19j Pro serial ports"
     );
 
-    // Open control port
     let control_port = tokio_serial::new(&control_port_path, 115200)
         .open_native_async()
         .map_err(|e| Error::Hardware(format!("Failed to open control port: {}", e)))?;
     let control_channel = ControlChannel::new(control_port);
 
-    // Create watch channel for board state, seeded with identity
     let serial = device.serial_number.clone();
     let initial_state = BoardState {
         name: format!("s19jpro-{}", serial.as_deref().unwrap_or("unknown")),
         model: "S19j Pro".into(),
         serial,
+        frequency_mhz: Some(S19J_PRO_TARGET_FREQ_MHZ),
+        hashboard_count: Some(HASHBOARD_COUNT as u8),
+        active_hashboard_count: Some(0),
+        hashboards: data_port_paths
+            .iter()
+            .enumerate()
+            .map(|(index, data_port_path)| HashboardState {
+                index: index as u8,
+                serial_port: Some(data_port_path.clone()),
+                is_present: false,
+                is_active: false,
+                hashrate: 0,
+            })
+            .collect(),
         ..Default::default()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
-    // Create and initialize board
-    let mut board = S19jPro::new(device, control_channel, data_port_path, state_tx);
-
+    let mut board = S19jPro::new(device, control_channel, data_port_paths, state_tx);
     board
         .initialize()
         .await
@@ -450,4 +727,30 @@ async fn create_from_usb(
 
     let registration = super::BoardRegistration { state_rx };
     Ok((Box::new(board), registration))
+}
+
+fn reset_pin_for_index(index: u8) -> BitcraneGpioPin {
+    match index {
+        0 => BitcraneGpioPin::Rst0,
+        1 => BitcraneGpioPin::Rst1,
+        2 => BitcraneGpioPin::Rst2,
+        _ => panic!("invalid hashboard index {}", index),
+    }
+}
+
+fn plug_pin_for_index(index: u8) -> BitcraneGpioPin {
+    match index {
+        0 => BitcraneGpioPin::Plug0,
+        1 => BitcraneGpioPin::Plug1,
+        2 => BitcraneGpioPin::Plug2,
+        _ => panic!("invalid hashboard index {}", index),
+    }
+}
+
+fn hashboard_count_u8(count: usize) -> u8 {
+    count.min(u8::MAX as usize) as u8
+}
+
+fn effective_hashrate(status: &HashThreadStatus) -> u64 {
+    u64::from(status.hashrate)
 }

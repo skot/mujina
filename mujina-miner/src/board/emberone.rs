@@ -383,6 +383,7 @@ impl Board for EmberOne {
                     io_power_enable_pin,
                 })),
                 voltage_regulator,
+                initialization_lock: Arc::new(Mutex::new(())),
             },
         };
 

@@ -786,12 +786,16 @@ impl BitaxeBoard {
                     name: board_name.clone(),
                     model: board_model.clone(),
                     serial: board_serial.clone(),
+                    frequency_mhz: None,
+                    hashboard_count: Some(1),
+                    active_hashboard_count: Some(1),
                     fans: vec![Fan {
                         name: "fan".into(),
                         rpm: fan_rpm,
                         percent: fan_percent,
                         target_percent: None,
                     }],
+                    hashboards: vec![],
                     temperatures: vec![
                         TemperatureSensor {
                             name: "asic".into(),

@@ -75,6 +75,10 @@ pub struct ChainPeripherals {
 
     /// Voltage regulator control (optional, may be shared across chains).
     pub voltage_regulator: Option<Arc<Mutex<dyn VoltageRegulator + Send>>>,
+
+    /// Serializes full cold-start initialization when multiple chains share
+    /// board-level control hardware such as a PSU or reset/control bridge.
+    pub initialization_lock: Arc<Mutex<()>>,
 }
 
 #[cfg(test)]
@@ -111,6 +115,7 @@ mod tests {
         let peripherals = ChainPeripherals {
             asic_enable: enable,
             voltage_regulator: None,
+            initialization_lock: Arc::new(Mutex::new(())),
         };
 
         // Hash thread enables

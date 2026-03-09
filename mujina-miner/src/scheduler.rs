@@ -36,6 +36,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc::error::TrySendError;
 
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{StreamExt, StreamMap};
@@ -277,10 +278,10 @@ impl Scheduler {
     ///
     /// Used with `broadcast_hashrate()` to avoid capturing `&self` across
     /// await points (Scheduler contains Box<dyn HashThread> which isn't Sync).
-    fn hashrate_senders(&self) -> Vec<mpsc::Sender<SourceCommand>> {
+    fn hashrate_senders(&self) -> Vec<(String, mpsc::Sender<SourceCommand>)> {
         self.sources
             .values()
-            .map(|s| s.command_tx.clone())
+            .map(|s| (s.name.clone(), s.command_tx.clone()))
             .collect()
     }
 
@@ -321,10 +322,13 @@ impl Scheduler {
 
         // Send current hashrate estimate to the new source
         let hashrate = self.operational_hashrate();
-        let _ = self.sources[source_id]
-            .command_tx
-            .send(SourceCommand::UpdateHashRate(hashrate))
-            .await;
+        let source = &self.sources[source_id];
+        let _ = try_send_source_command(
+            &source.command_tx,
+            SourceCommand::UpdateHashRate(hashrate),
+            &source.name,
+            "initial hashrate update",
+        );
     }
 
     /// Assign or replace work on all threads from a job template.
@@ -498,23 +502,17 @@ impl Scheduler {
 
         // Check if share meets source threshold
         if task_entry.template.share_target.is_met_by(hash) {
-            self.stats.shares_submitted += 1;
-
             // Submit share to originating source
             if let Some(source) = self.sources.get(task_entry.source_id) {
                 let source_share = SourceShare::from((share, task_entry.template.id.clone()));
 
-                if let Err(e) = source
-                    .command_tx
-                    .send(SourceCommand::SubmitShare(source_share))
-                    .await
-                {
-                    error!(
-                        source_id = ?task_entry.source_id,
-                        error = %e,
-                        "Failed to submit share to source"
-                    );
-                } else {
+                if try_send_source_command(
+                    &source.command_tx,
+                    SourceCommand::SubmitShare(source_share),
+                    &source.name,
+                    "share submission",
+                ) {
+                    self.stats.shares_submitted += 1;
                     debug!(source = %source.name, "Share submitted to source");
                 }
             } else {
@@ -586,7 +584,7 @@ impl Scheduler {
         // Broadcast updated hashrate to all sources
         let hashrate = self.operational_hashrate();
         let senders = self.hashrate_senders();
-        broadcast_hashrate(senders, hashrate).await;
+        broadcast_hashrate(senders, hashrate);
 
         // Reset difficulty alarm since hashrate changed
         for source in self.sources.values_mut() {
@@ -688,7 +686,7 @@ impl Scheduler {
         // Broadcast updated hashrate to all sources
         let hashrate = self.operational_hashrate();
         let senders = self.hashrate_senders();
-        broadcast_hashrate(senders, hashrate).await;
+        broadcast_hashrate(senders, hashrate);
 
         // Reset difficulty alarm since hashrate changed
         for source in self.sources.values_mut() {
@@ -830,7 +828,7 @@ impl Scheduler {
                     } else {
                         let hashrate = self.operational_hashrate();
                         let senders = self.hashrate_senders();
-                        broadcast_hashrate(senders, hashrate).await;
+                        broadcast_hashrate(senders, hashrate);
                     }
                     let _ = miner_state_tx.send(self.compute_miner_state());
                 }
@@ -866,9 +864,33 @@ impl Scheduler {
 ///
 /// Takes pre-collected senders to avoid capturing Scheduler across await
 /// points (it contains Box<dyn HashThread> which isn't Sync).
-async fn broadcast_hashrate(senders: Vec<mpsc::Sender<SourceCommand>>, hashrate: HashRate) {
-    for sender in senders {
-        let _ = sender.send(SourceCommand::UpdateHashRate(hashrate)).await;
+fn broadcast_hashrate(senders: Vec<(String, mpsc::Sender<SourceCommand>)>, hashrate: HashRate) {
+    for (source_name, sender) in senders {
+        let _ = try_send_source_command(
+            &sender,
+            SourceCommand::UpdateHashRate(hashrate),
+            &source_name,
+            "hashrate update",
+        );
+    }
+}
+
+fn try_send_source_command(
+    sender: &mpsc::Sender<SourceCommand>,
+    command: SourceCommand,
+    source_name: &str,
+    action: &str,
+) -> bool {
+    match sender.try_send(command) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            warn!(source = source_name, action, "Source command queue full; dropping command");
+            false
+        }
+        Err(TrySendError::Closed(_)) => {
+            warn!(source = source_name, action, "Source command queue closed; dropping command");
+            false
+        }
     }
 }
 
@@ -1041,6 +1063,44 @@ mod tests {
                 "clamp invariant violated at {hashrate}: \
                  hardest={hardest:?} easiest={easiest:?}"
             );
+        }
+    }
+
+    #[test]
+    fn source_command_try_send_returns_false_when_queue_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(SourceCommand::UpdateHashRate(HashRate::from(1)))
+            .unwrap();
+
+        let queued = try_send_source_command(
+            &tx,
+            SourceCommand::UpdateHashRate(HashRate::from(2)),
+            "pool",
+            "hashrate update",
+        );
+
+        assert!(!queued);
+        match rx.try_recv() {
+            Ok(SourceCommand::UpdateHashRate(rate)) => assert_eq!(u64::from(rate), 1),
+            other => panic!("expected queued hashrate update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_command_try_send_returns_true_when_queue_has_capacity() {
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let queued = try_send_source_command(
+            &tx,
+            SourceCommand::UpdateHashRate(HashRate::from(2)),
+            "pool",
+            "hashrate update",
+        );
+
+        assert!(queued);
+        match rx.try_recv() {
+            Ok(SourceCommand::UpdateHashRate(rate)) => assert_eq!(u64::from(rate), 2),
+            other => panic!("expected queued hashrate update, got {other:?}"),
         }
     }
 }

@@ -33,7 +33,7 @@ use crate::{
     },
     job_source::MerkleRootKind,
     tracing::prelude::*,
-    types::{Difficulty, HashRate},
+    types::{Difficulty, HashRate, HashrateEstimator, Work},
 };
 
 /// Minimum chip count required for initialization to succeed.
@@ -106,6 +106,7 @@ impl BM13xxThread {
         // share_target >= TicketMask difficulty. The HashrateEstimator will
         // refine this once shares start flowing.
         let initial_hashrate = HashRate::from_gigahashes(83.0 * chain.chip_count() as f64);
+        let nonce_work = nonce_work_for_chain(chain.chip_count());
 
         // Spawn reader task - continuously reads from serial to prevent USB
         // CDC-ACM flow control from blocking TX. Runs until chip_rx closes.
@@ -125,6 +126,8 @@ impl BM13xxThread {
                 chip_state: ChipState::Disabled,
                 current_task: None,
                 chip_jobs: ChipJobs::new(),
+                hashrate_estimator: HashrateEstimator::new(Duration::from_secs(60)),
+                nonce_work,
             };
             actor.run().await;
         });
@@ -138,6 +141,11 @@ impl BM13xxThread {
             status,
             event_rx: Some(evt_rx),
         })
+    }
+
+    /// Shared cached runtime status for external telemetry publishers.
+    pub fn status_handle(&self) -> Arc<RwLock<HashThreadStatus>> {
+        Arc::clone(&self.status)
     }
 }
 
@@ -175,30 +183,28 @@ impl HashThread for BM13xxThread {
         &mut self,
         new_task: HashTask,
     ) -> Result<Option<HashTask>, HashThreadError> {
-        let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::UpdateTask {
                 new_task,
-                response_tx: tx,
+                response_tx: oneshot::channel().0,
             })
             .await
             .map_err(|_| HashThreadError::ThreadOffline)?;
-        rx.await.map_err(|_| HashThreadError::ThreadOffline)?
+        Ok(None)
     }
 
     async fn replace_task(
         &mut self,
         new_task: HashTask,
     ) -> Result<Option<HashTask>, HashThreadError> {
-        let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(ThreadCommand::ReplaceTask {
                 new_task,
-                response_tx: tx,
+                response_tx: oneshot::channel().0,
             })
             .await
             .map_err(|_| HashThreadError::ThreadOffline)?;
-        rx.await.map_err(|_| HashThreadError::ThreadOffline)?
+        Ok(None)
     }
 
     async fn go_idle(&mut self) -> Result<Option<HashTask>, HashThreadError> {
@@ -263,6 +269,8 @@ struct BM13xxActor<W> {
     current_task: Option<HashTask>,
     /// Maps chip job IDs to tasks for nonce correlation.
     chip_jobs: ChipJobs,
+    hashrate_estimator: HashrateEstimator,
+    nonce_work: Work,
 }
 
 /// Commands sent from the facade ([`BM13xxThread`]) to the actor.
@@ -428,6 +436,8 @@ where
         // ntime rolling timer - sends new job every second with incremented timestamp
         let mut ntime_ticker = time::interval(Duration::from_secs(1));
         ntime_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        let mut status_ticker = time::interval(Duration::from_secs(2));
+        status_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -443,6 +453,9 @@ where
                 }
                 _ = ntime_ticker.tick(), if self.current_task.is_some() => {
                     self.roll_ntime().await;
+                }
+                _ = status_ticker.tick() => {
+                    self.status.write().hashrate = self.hashrate_estimator.hashrate();
                 }
             }
         }
@@ -499,16 +512,22 @@ where
         &mut self,
         new_task: HashTask,
     ) -> Result<Option<HashTask>, HashThreadError> {
+        let initialization_lock = self.peripherals.initialization_lock.clone();
+
         // Initialize chips if not already running
         if matches!(self.chip_state, ChipState::Disabled) {
-            self.initialize_chips().await?;
+            let _init_guard = initialization_lock.lock().await;
+            if matches!(self.chip_state, ChipState::Disabled) {
+                self.initialize_chips().await?;
+            }
         }
 
         // Send job to chips
         self.send_job(&new_task).await?;
 
         let old = self.current_task.replace(new_task);
-        self.status.write().is_active = true;
+        let mut status = self.status.write();
+        status.is_active = true;
         Ok(old)
     }
 
@@ -546,7 +565,9 @@ where
         self.disable_chips().await;
 
         let old = self.current_task.take();
-        self.status.write().is_active = false;
+        let mut status = self.status.write();
+        status.is_active = false;
+        status.hashrate = HashRate::from(0);
         Ok(old)
     }
 
@@ -583,7 +604,10 @@ where
             drained += 1;
         }
         if drained > 0 {
-            debug!(count = drained, "Drained stale responses before enumeration");
+            debug!(
+                count = drained,
+                "Drained stale responses before enumeration"
+            );
         }
 
         // 2. Execute enumeration sequence (assigns addresses)
@@ -775,13 +799,13 @@ where
         if responding < chip_count {
             warn!(
                 expected = chip_count,
-                responding,
-                "Chips lost during frequency ramp"
+                responding, "Chips lost during frequency ramp"
             );
         }
 
         if has_regulator {
-            let final_v = voltage_for_frequency_stacked(steps.last().unwrap().0, domain_count, max_v);
+            let final_v =
+                voltage_for_frequency_stacked(steps.last().unwrap().0, domain_count, max_v);
             info!(
                 target_mhz = target.mhz(),
                 voltage = format!("{:.2}V", final_v),
@@ -892,6 +916,13 @@ where
                 midstate_num,
                 subcore_id,
             }) => {
+                self.hashrate_estimator.record(self.nonce_work);
+                {
+                    let mut status = self.status.write();
+                    status.hashrate = self.hashrate_estimator.hashrate();
+                    status.chip_shares_found = status.chip_shares_found.saturating_add(1);
+                }
+
                 // HACK: BM1362 job_id fix - protocol.rs extracts job_id from bits 7-4,
                 // but BM1362 returns it in bits 6-3. Reconstruct result_header and re-extract.
                 // TODO: Move this to protocol.rs with chip-type-aware parsing.
@@ -1017,8 +1048,24 @@ where
     }
 }
 
+fn nonce_work_for_chain(chip_count: usize) -> Work {
+    let hashrate_gh = 83.0 * chip_count as f64;
+    let reporting_interval = protocol::ReportingInterval::from_rate(
+        protocol::Hashrate::gibihashes_per_sec(hashrate_gh),
+        protocol::ReportingRate::nonces_per_sec(1.0),
+    );
+    work_from_hash_count(1u64 << reporting_interval.exponent())
+}
+
+fn work_from_hash_count(hash_count: u64) -> Work {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&hash_count.to_le_bytes());
+    Work::from_le_bytes(bytes)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::io;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -1134,6 +1181,71 @@ mod tests {
         }
     }
 
+    /// Sink that captures commands and injects scripted read responses on demand.
+    struct ScriptedResponseSink {
+        commands: Arc<std::sync::Mutex<Vec<Command>>>,
+        response_tx: mpsc::Sender<Result<protocol::Response, io::Error>>,
+        scripted_reads: VecDeque<Vec<Result<protocol::Response, io::Error>>>,
+    }
+
+    impl ScriptedResponseSink {
+        fn new(
+            response_tx: mpsc::Sender<Result<protocol::Response, io::Error>>,
+            scripted_reads: Vec<Vec<Result<protocol::Response, io::Error>>>,
+        ) -> (Self, Arc<std::sync::Mutex<Vec<Command>>>) {
+            let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    commands: Arc::clone(&commands),
+                    response_tx,
+                    scripted_reads: scripted_reads.into(),
+                },
+                commands,
+            )
+        }
+    }
+
+    impl Sink<Command> for ScriptedResponseSink {
+        type Error = io::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Command) -> io::Result<()> {
+            self.commands.lock().unwrap().push(item.clone());
+
+            if matches!(
+                item,
+                Command::ReadRegister {
+                    register_address: RegisterAddress::ChipId,
+                    ..
+                }
+            ) {
+                if let Some(responses) = self.scripted_reads.pop_front() {
+                    for response in responses {
+                        self.response_tx.try_send(response).map_err(|err| {
+                            io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                format!("failed to script response: {err}"),
+                            )
+                        })?;
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     /// Build a ChipId response for testing.
     fn chip_id_response(chip_type: ChipType, address: u8) -> Result<protocol::Response, io::Error> {
         Ok(protocol::Response::ReadRegister {
@@ -1155,6 +1267,7 @@ mod tests {
             peripherals: ChainPeripherals {
                 asic_enable: Arc::new(Mutex::new(asic_enable)),
                 voltage_regulator: None,
+                initialization_lock: Arc::new(Mutex::new(())),
             },
         }
     }
@@ -1176,6 +1289,7 @@ mod tests {
         let (_cmd_tx, cmd_rx) = mpsc::channel(10);
         let (evt_tx, _evt_rx) = mpsc::channel(100);
         let status = Arc::new(RwLock::new(HashThreadStatus::default()));
+        let nonce_work = nonce_work_for_chain(chain.chip_count());
 
         // Pre-load responses into a channel
         let (response_tx, response_rx) = mpsc::channel(128);
@@ -1192,13 +1306,64 @@ mod tests {
             peripherals: ChainPeripherals {
                 asic_enable: Arc::new(Mutex::new(asic_enable)),
                 voltage_regulator: None,
+                initialization_lock: Arc::new(Mutex::new(())),
             },
             chain,
             sequencer,
             chip_state: ChipState::Disabled,
             current_task: None,
             chip_jobs: ChipJobs::new(),
+            hashrate_estimator: HashrateEstimator::new(Duration::from_secs(60)),
+            nonce_work,
         }
+    }
+
+    /// Create a test actor whose sink injects scripted ChipId responses when verification reads occur.
+    fn test_actor_with_scripted_reads(
+        responses: Vec<Result<protocol::Response, io::Error>>,
+        chain: Chain,
+        sequencer: Sequencer,
+        asic_enable: MockAsicEnable,
+    ) -> (BM13xxActor<ScriptedResponseSink>, Arc<std::sync::Mutex<Vec<Command>>>) {
+        let scripted_reads = responses.into_iter().map(|response| vec![response]).collect();
+        test_actor_with_scripted_read_batches(scripted_reads, chain, sequencer, asic_enable)
+    }
+
+    fn test_actor_with_scripted_read_batches(
+        scripted_reads: Vec<Vec<Result<protocol::Response, io::Error>>>,
+        chain: Chain,
+        sequencer: Sequencer,
+        asic_enable: MockAsicEnable,
+    ) -> (BM13xxActor<ScriptedResponseSink>, Arc<std::sync::Mutex<Vec<Command>>>) {
+        let (_cmd_tx, cmd_rx) = mpsc::channel(10);
+        let (evt_tx, _evt_rx) = mpsc::channel(100);
+        let status = Arc::new(RwLock::new(HashThreadStatus::default()));
+        let nonce_work = nonce_work_for_chain(chain.chip_count());
+        let (response_tx, response_rx) = mpsc::channel(128);
+        let (chip_tx, commands) = ScriptedResponseSink::new(response_tx, scripted_reads);
+
+        (
+            BM13xxActor {
+                cmd_rx,
+                evt_tx,
+                status,
+                response_rx,
+                chip_tx,
+                peripherals: ChainPeripherals {
+                    asic_enable: Arc::new(Mutex::new(asic_enable)),
+                    voltage_regulator: None,
+                    initialization_lock: Arc::new(Mutex::new(())),
+                },
+                chain,
+                sequencer,
+                chip_state: ChipState::Disabled,
+                current_task: None,
+                chip_jobs: ChipJobs::new(),
+                hashrate_estimator: HashrateEstimator::new(Duration::from_secs(60)),
+                nonce_work,
+            },
+            commands,
+        )
     }
 
     /// Create chain and sequencer for a given chip count.
@@ -1256,10 +1421,10 @@ mod tests {
     async fn initialize_single_chip_succeeds() {
         // Topology expects 1 chip, hardware provides 1 chip response
         let responses = vec![chip_id_response(ChipType::BM1362, 0x00)];
-        let chip_tx = futures::sink::drain();
 
         let (chain, sequencer) = chain_and_sequencer(1);
-        let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
+        let (mut actor, _commands) =
+            test_actor_with_scripted_reads(responses, chain, sequencer, MockAsicEnable::new());
 
         let result = actor.initialize_chips().await;
 
@@ -1273,10 +1438,10 @@ mod tests {
         let responses: Vec<_> = (0..12)
             .map(|i| chip_id_response(ChipType::BM1362, i * 2)) // interval 2
             .collect();
-        let chip_tx = futures::sink::drain();
 
         let (chain, sequencer) = chain_and_sequencer(12);
-        let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
+        let (mut actor, _commands) =
+            test_actor_with_scripted_reads(responses, chain, sequencer, MockAsicEnable::new());
 
         let result = actor.initialize_chips().await;
 
@@ -1289,13 +1454,20 @@ mod tests {
         // Topology expects 12 chips, respond with minimum viable count (at threshold)
         let expected = 12;
         let responding = min_viable_chip_count(expected);
-        let responses: Vec<_> = (0..responding)
-            .map(|i| chip_id_response(ChipType::BM1362, (i * 2) as u8))
-            .collect();
-        let chip_tx = futures::sink::drain();
-
         let (chain, sequencer) = chain_and_sequencer(expected);
-        let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
+        let scripted_reads = (0..3)
+            .flat_map(|_| {
+                (0..responding)
+                    .map(|i| vec![chip_id_response(ChipType::BM1362, (i * 2) as u8)])
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let (mut actor, _commands) = test_actor_with_scripted_read_batches(
+            scripted_reads,
+            chain,
+            sequencer,
+            MockAsicEnable::new(),
+        );
 
         // Should succeed with warning, not fail
         let result = actor.initialize_chips().await;
@@ -1311,10 +1483,10 @@ mod tests {
         let responses: Vec<_> = (0..responding)
             .map(|i| chip_id_response(ChipType::BM1362, (i * 2) as u8))
             .collect();
-        let chip_tx = futures::sink::drain();
 
         let (chain, sequencer) = chain_and_sequencer(expected);
-        let mut actor = test_actor(responses, chip_tx, chain, sequencer, MockAsicEnable::new());
+        let (mut actor, _commands) =
+            test_actor_with_scripted_reads(responses, chain, sequencer, MockAsicEnable::new());
 
         let result = actor.initialize_chips().await;
 
@@ -1446,10 +1618,10 @@ mod tests {
         let responses: Vec<_> = (0..5)
             .map(|i| chip_id_response(ChipType::BM1362, i * 2))
             .collect();
-        let (sink, _commands) = CapturingSink::new();
 
         let (chain, sequencer) = chain_and_sequencer(5);
-        let mut actor = test_actor(responses, sink, chain, sequencer, MockAsicEnable::new());
+        let (mut actor, _commands) =
+            test_actor_with_scripted_reads(responses, chain, sequencer, MockAsicEnable::new());
 
         let count = actor.verify_chain().await;
 
@@ -1458,19 +1630,23 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn verify_chain_ignores_other_responses() {
-        let responses: Vec<Result<protocol::Response, io::Error>> = vec![
-            chip_id_response(ChipType::BM1362, 0x00),
-            // Non-ChipId response should be ignored
-            Ok(protocol::Response::ReadRegister {
-                chip_address: 0x02,
-                register: Register::VersionMask(protocol::VersionMask::full_rolling()),
-            }),
-            chip_id_response(ChipType::BM1362, 0x04),
-        ];
-        let (sink, _commands) = CapturingSink::new();
-
         let (chain, sequencer) = chain_and_sequencer(2);
-        let mut actor = test_actor(responses, sink, chain, sequencer, MockAsicEnable::new());
+        let scripted_reads = vec![
+            vec![chip_id_response(ChipType::BM1362, 0x00)],
+            vec![
+                Ok(protocol::Response::ReadRegister {
+                    chip_address: 0x02,
+                    register: Register::VersionMask(protocol::VersionMask::full_rolling()),
+                }),
+                chip_id_response(ChipType::BM1362, 0x04),
+            ],
+        ];
+        let (mut actor, _commands) = test_actor_with_scripted_read_batches(
+            scripted_reads,
+            chain,
+            sequencer,
+            MockAsicEnable::new(),
+        );
 
         let count = actor.verify_chain().await;
 
@@ -1479,15 +1655,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn verify_chain_handles_stream_errors() {
-        let responses: Vec<Result<protocol::Response, io::Error>> = vec![
-            chip_id_response(ChipType::BM1362, 0x00),
-            Err(io::Error::new(io::ErrorKind::Other, "glitch")),
-            chip_id_response(ChipType::BM1362, 0x02),
-        ];
-        let (sink, _commands) = CapturingSink::new();
-
         let (chain, sequencer) = chain_and_sequencer(2);
-        let mut actor = test_actor(responses, sink, chain, sequencer, MockAsicEnable::new());
+        let scripted_reads = vec![
+            vec![chip_id_response(ChipType::BM1362, 0x00)],
+            vec![
+                Err(io::Error::new(io::ErrorKind::Other, "glitch")),
+                chip_id_response(ChipType::BM1362, 0x02),
+            ],
+        ];
+        let (mut actor, _commands) = test_actor_with_scripted_read_batches(
+            scripted_reads,
+            chain,
+            sequencer,
+            MockAsicEnable::new(),
+        );
 
         let count = actor.verify_chain().await;
 

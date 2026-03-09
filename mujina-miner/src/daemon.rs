@@ -27,6 +27,8 @@ use crate::{
     transport::{CpuDeviceInfo, TransportEvent, UsbTransport, cpu as cpu_transport},
 };
 
+const SOURCE_COMMAND_BUFFER: usize = 1024;
+
 /// The main daemon.
 pub struct Daemon {
     shutdown: CancellationToken,
@@ -110,7 +112,7 @@ impl Daemon {
         // - MUJINA_POOL_USER: Worker username (optional, defaults to "mujina-testing")
         // - MUJINA_POOL_PASS: Worker password (optional, defaults to "x")
         let (source_event_tx, source_event_rx) = mpsc::channel::<SourceEvent>(100);
-        let (source_cmd_tx, source_cmd_rx) = mpsc::channel(10);
+        let (source_cmd_tx, source_cmd_rx) = mpsc::channel(SOURCE_COMMAND_BUFFER);
 
         if let Ok(pool_url) = env::var("MUJINA_POOL_URL") {
             // Use Stratum v1 source
@@ -134,7 +136,8 @@ impl Daemon {
 
                 // Create inner channels (stratum <-> wrapper)
                 let (inner_event_tx, inner_event_rx) = mpsc::channel::<SourceEvent>(100);
-                let (inner_cmd_tx, inner_cmd_rx) = mpsc::channel::<SourceCommand>(10);
+                let (inner_cmd_tx, inner_cmd_rx) =
+                    mpsc::channel::<SourceCommand>(SOURCE_COMMAND_BUFFER);
 
                 let stratum_source = StratumV1Source::new(
                     stratum_config,

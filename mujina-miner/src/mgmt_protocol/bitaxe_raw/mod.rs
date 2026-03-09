@@ -297,10 +297,31 @@ impl Decoder for ControlCodec {
         // Peek at length without consuming
         let length_field = u16::from_le_bytes([src[0], src[1]]) as usize;
 
-        // In bitaxe-raw, the length field contains the length of the response data only,
-        // NOT including the 2-byte length field itself or the 1-byte ID.
-        // Total packet size = 2 (length) + 1 (ID) + length_field
-        let total_packet_size = 2 + 1 + length_field;
+        // Normal responses encode the payload length, so total packet size is:
+        // 2 (length) + 1 (ID) + payload length.
+        //
+        // Some currently deployed RP2040 firmware variants incorrectly encode
+        // error responses with the total packet size in the length field
+        // instead. Those frames look like:
+        //   [total_len:2] [id:1] [0xff] [error_code...]
+        // We tolerate that quirk here so a single unsupported telemetry
+        // command does not permanently desynchronize the control stream.
+        let legacy_error_packet = length_field >= 4
+            && src.len() >= length_field
+            && match src.get(3).copied() {
+                Some(ERROR_MARKER) => true,
+                Some(code) => matches!(
+                    ErrorCode::try_from(code),
+                    Ok(ErrorCode::Timeout | ErrorCode::InvalidCommand | ErrorCode::BufferOverflow)
+                ),
+                None => false,
+            };
+
+        let total_packet_size = if legacy_error_packet {
+            length_field
+        } else {
+            2 + 1 + length_field
+        };
 
         if total_packet_size > self.max_length {
             return Err(io::Error::new(
@@ -317,10 +338,29 @@ impl Decoder for ControlCodec {
         // Consume the complete packet
         let packet_data = src.split_to(total_packet_size);
 
-        // Skip the 2-byte length field
-        let response_data = &packet_data[2..];
-
-        let response = Response::parse(response_data)?;
+        let response = if legacy_error_packet {
+            let id = packet_data[2];
+            match packet_data[3] {
+                ERROR_MARKER => Response::parse(&packet_data[2..])?,
+                code => Response {
+                    id,
+                    data: vec![],
+                    error: Some(ResponseError {
+                        code: ErrorCode::try_from(code).map_err(|unknown| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Unknown error code: 0x{:02x}", unknown),
+                            )
+                        })?,
+                        message: None,
+                    }),
+                },
+            }
+        } else {
+            // Skip the 2-byte length field
+            let response_data = &packet_data[2..];
+            Response::parse(response_data)?
+        };
 
         trace!(
             id = response.id,
@@ -402,5 +442,17 @@ mod tests {
         assert_eq!(response.id, 0x42);
         assert!(response.is_error());
         assert_eq!(response.error().unwrap().code, ErrorCode::InvalidCommand);
+    }
+
+    #[test]
+    fn test_decoder_accepts_legacy_error_length_encoding() {
+        let mut codec = ControlCodec::default();
+        let mut src = BytesMut::from(&[0x04, 0x00, 0x42, 0x11][..]);
+
+        let response = codec.decode(&mut src).unwrap().unwrap();
+        assert_eq!(response.id, 0x42);
+        assert!(response.is_error());
+        assert_eq!(response.error().unwrap().code, ErrorCode::InvalidCommand);
+        assert!(src.is_empty());
     }
 }

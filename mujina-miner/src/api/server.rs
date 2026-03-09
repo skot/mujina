@@ -41,6 +41,12 @@ impl SharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .boards();
+        state.hashrate = state
+            .boards
+            .iter()
+            .flat_map(|board| board.threads.iter())
+            .map(|thread| thread.hashrate)
+            .sum();
         state
     }
 }
@@ -136,7 +142,7 @@ mod tests {
 
     use super::*;
     use crate::api::commands::SchedulerCommand;
-    use crate::api_client::types::{BoardState, SourceState};
+    use crate::api_client::types::{BoardState, SourceState, ThreadState};
     use crate::board::BoardRegistration;
 
     /// Test fixtures returned by the router builder.
@@ -205,6 +211,11 @@ mod tests {
         let board = BoardState {
             name: "test-board".into(),
             model: "TestModel".into(),
+            threads: vec![ThreadState {
+                name: "thread-0".into(),
+                hashrate: 1_000_000,
+                is_active: true,
+            }],
             ..Default::default()
         };
         let fixtures = build_test_router(miner_state, vec![board]);
