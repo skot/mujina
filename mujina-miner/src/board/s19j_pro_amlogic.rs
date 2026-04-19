@@ -41,7 +41,7 @@ use crate::{
             HashThreadEvent, HashThreadStatus,
         },
     },
-    config::{AmlogicControlBoardConfig, AmlogicHashboardConfig},
+    config::{AmlogicControlBoardConfig, AmlogicFanControlConfig, AmlogicHashboardConfig},
     error::Error,
     tracing::prelude::*,
     transport::serial::SerialStream,
@@ -79,6 +79,7 @@ pub struct S19jProAmlogic {
     selected_hashboard: AmlogicHashboardConfig,
     board_serial: Option<String>,
     psu: Arc<Mutex<NativeAmlogicPsu>>,
+    psu_online: bool,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
     telemetry_shutdown: CancellationToken,
@@ -90,6 +91,7 @@ impl S19jProAmlogic {
         selected_hashboard: AmlogicHashboardConfig,
         board_serial: Option<String>,
         psu: Arc<Mutex<NativeAmlogicPsu>>,
+        psu_online: bool,
         state_tx: watch::Sender<BoardState>,
     ) -> Self {
         Self {
@@ -97,6 +99,7 @@ impl S19jProAmlogic {
             selected_hashboard,
             board_serial,
             psu,
+            psu_online,
             state_tx,
             thread_states: Arc::new(std::sync::Mutex::new(Vec::new())),
             telemetry_shutdown: CancellationToken::new(),
@@ -111,6 +114,7 @@ impl S19jProAmlogic {
             AmlogicHashboardConfig,
             Option<String>,
             Arc<Mutex<NativeAmlogicPsu>>,
+            bool,
         ),
         BoardError,
     > {
@@ -131,23 +135,32 @@ impl S19jProAmlogic {
         assert_all_resets(config)?;
 
         let psu = Arc::new(Mutex::new(NativeAmlogicPsu::new(config)));
-        let measured_voltage = {
+        let (measured_voltage, psu_online) = {
             let mut psu_guard = psu.lock().await;
             psu_guard
                 .set_enabled(true)
                 .map_err(|e| BoardError::HardwareControl(format!("Failed to enable PSU: {e}")))?;
-            psu_guard.config_watchdog(0x00).map_err(|e| {
-                BoardError::HardwareControl(format!("Failed to disable PSU watchdog: {e}"))
-            })?;
-            psu_guard
-                .set_voltage(config.startup.initial_voltage)
-                .await
-                .map_err(|e| {
-                    BoardError::HardwareControl(format!("Failed to set PSU voltage: {e}"))
-                })?;
 
             tokio::time::sleep(Duration::from_millis(config.startup.psu_settle_ms)).await;
-            psu_guard.measure_voltage().ok()
+            match psu_guard.config_watchdog(0x00) {
+                Ok(()) => {
+                    psu_guard
+                        .set_voltage(config.startup.initial_voltage)
+                        .await
+                        .map_err(|e| {
+                            BoardError::HardwareControl(format!("Failed to set PSU voltage: {e}"))
+                        })?;
+                    (psu_guard.measure_voltage().ok(), true)
+                }
+                Err(error) => {
+                    warn!(
+                        board = %board_name,
+                        error = %error,
+                        "APW12 control path unavailable; continuing with GPIO-only PSU enable"
+                    );
+                    (None, false)
+                }
+            }
         };
 
         let fan_states = build_fan_state(config, config.startup.default_fan_percent);
@@ -167,7 +180,7 @@ impl S19jProAmlogic {
             state.powers = power_states.clone();
         });
 
-        Ok((selected_hashboard, board_serial, psu))
+        Ok((selected_hashboard, board_serial, psu, psu_online))
     }
 }
 
@@ -224,9 +237,9 @@ impl Board for S19jProAmlogic {
                     gpio: SysfsGpio::new(self.selected_hashboard.reset_gpio),
                     reset_release_ms: self.config.startup.reset_release_ms,
                 })),
-                voltage_regulator: Some(
-                    Arc::clone(&self.psu) as Arc<Mutex<dyn VoltageRegulator + Send>>
-                ),
+                voltage_regulator: self
+                    .psu_online
+                    .then(|| Arc::clone(&self.psu) as Arc<Mutex<dyn VoltageRegulator + Send>>),
             },
         };
 
@@ -269,7 +282,7 @@ impl Board for S19jProAmlogic {
 
         let config = self.config.clone();
         let hashboard = self.selected_hashboard.clone();
-        let psu = Arc::clone(&self.psu);
+        let psu = self.psu_online.then(|| Arc::clone(&self.psu));
         let state_tx = self.state_tx.clone();
         let thread_states = Arc::clone(&self.thread_states);
         let shutdown = self.telemetry_shutdown.child_token();
@@ -396,6 +409,65 @@ impl HashThread for BoardStateHashThread {
 struct NativeResetControl {
     gpio: SysfsGpio,
     reset_release_ms: u64,
+}
+
+struct AmlogicFanController {
+    config: AmlogicFanControlConfig,
+    baseline_percent: u8,
+    previous_temp_c: Option<f32>,
+    integral_error: f32,
+}
+
+impl AmlogicFanController {
+    fn new(config: &AmlogicControlBoardConfig) -> Self {
+        Self {
+            config: config.startup.fan_control.clone(),
+            baseline_percent: config.startup.default_fan_percent,
+            previous_temp_c: None,
+            integral_error: 0.0,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    fn target_percent(&mut self, temperatures: &[TemperatureSensor], interval: Duration) -> u8 {
+        if !self.config.enabled {
+            return self.baseline_percent;
+        }
+
+        let max_temp_c = temperatures
+            .iter()
+            .filter_map(|sensor| sensor.temperature_c)
+            .reduce(f32::max);
+
+        let Some(max_temp_c) = max_temp_c else {
+            self.previous_temp_c = None;
+            self.integral_error = 0.0;
+            return self.config.max_percent;
+        };
+
+        let interval_secs = interval.as_secs_f32().max(0.001);
+        let error = max_temp_c - self.config.target_temp_c;
+        self.integral_error = (self.integral_error + error * interval_secs)
+            .clamp(-self.config.integral_limit, self.config.integral_limit);
+        let derivative = self
+            .previous_temp_c
+            .map(|previous| (max_temp_c - previous) / interval_secs)
+            .unwrap_or(0.0);
+        self.previous_temp_c = Some(max_temp_c);
+
+        let pid_output = self.baseline_percent as f32
+            + (self.config.kp * error)
+            + (self.config.ki * self.integral_error)
+            + (self.config.kd * derivative);
+
+        pid_output.round().clamp(
+            self.config.min_percent as f32,
+            self.config.max_percent as f32,
+        ) as u8
+    }
 }
 
 #[async_trait]
@@ -688,12 +760,14 @@ fn build_fan_state(config: &AmlogicControlBoardConfig, percent: u8) -> Vec<Fan> 
 async fn native_telemetry_task(
     config: AmlogicControlBoardConfig,
     hashboard: AmlogicHashboardConfig,
-    psu: Arc<Mutex<NativeAmlogicPsu>>,
+    psu: Option<Arc<Mutex<NativeAmlogicPsu>>>,
     state_tx: watch::Sender<BoardState>,
     thread_states: Arc<std::sync::Mutex<Vec<crate::api_client::types::ThreadState>>>,
     shutdown: CancellationToken,
 ) {
     const TELEMETRY_INTERVAL: Duration = Duration::from_secs(2);
+    let mut fan_controller = AmlogicFanController::new(&config);
+    let mut applied_fan_percent = config.startup.default_fan_percent;
 
     loop {
         if shutdown.is_cancelled() {
@@ -708,13 +782,43 @@ async fn native_telemetry_task(
             }
         };
 
-        let fans = read_fan_states(&config, config.startup.default_fan_percent).await;
-        let voltage_v = match psu.lock().await.measure_voltage() {
-            Ok(voltage_v) => Some(voltage_v),
-            Err(error) => {
-                debug!(error = %error, "Native telemetry PSU voltage read failed");
-                None
+        let requested_fan_percent =
+            fan_controller.target_percent(&temperatures, TELEMETRY_INTERVAL);
+        if requested_fan_percent != applied_fan_percent {
+            if let Err(error) = configure_fans(&config, requested_fan_percent) {
+                warn!(
+                    percent = requested_fan_percent,
+                    error = %error,
+                    "Failed to apply native Amlogic fan target"
+                );
+            } else {
+                if fan_controller.is_enabled() {
+                    let peak_temp_c = temperatures
+                        .iter()
+                        .filter_map(|sensor| sensor.temperature_c)
+                        .reduce(f32::max);
+                    debug!(
+                        percent = requested_fan_percent,
+                        target_temp_c = fan_controller.config.target_temp_c,
+                        peak_temp_c,
+                        "Updated native Amlogic fan target"
+                    );
+                }
+                applied_fan_percent = requested_fan_percent;
             }
+        }
+
+        let fans = read_fan_states(&config, applied_fan_percent).await;
+        let voltage_v = if let Some(psu) = &psu {
+            match psu.lock().await.measure_voltage() {
+                Ok(voltage_v) => Some(voltage_v),
+                Err(error) => {
+                    debug!(error = %error, "Native telemetry PSU voltage read failed");
+                    None
+                }
+            }
+        } else {
+            None
         };
         let powers = vec![PowerMeasurement {
             name: "apw12".into(),
@@ -773,7 +877,7 @@ async fn read_fan_states(config: &AmlogicControlBoardConfig, target_percent: u8)
         fan_states.push(Fan {
             name: fan_name,
             rpm,
-            percent: None,
+            percent: Some(target_percent),
             target_percent: Some(target_percent),
         });
     }
@@ -941,11 +1045,21 @@ async fn create_amlogic_board()
     };
     let (state_tx, state_rx) = watch::channel(initial_state);
 
-    let (selected_hashboard, board_serial, psu) = S19jProAmlogic::initialize(&config, &state_tx)
-        .await
-        .map_err(|e| Error::Hardware(format!("Failed to initialize native Amlogic board: {e}")))?;
+    let (selected_hashboard, board_serial, psu, psu_online) =
+        S19jProAmlogic::initialize(&config, &state_tx)
+            .await
+            .map_err(|e| {
+                Error::Hardware(format!("Failed to initialize native Amlogic board: {e}"))
+            })?;
 
-    let board = S19jProAmlogic::new(config, selected_hashboard, board_serial, psu, state_tx);
+    let board = S19jProAmlogic::new(
+        config,
+        selected_hashboard,
+        board_serial,
+        psu,
+        psu_online,
+        state_tx,
+    );
     let registration = super::BoardRegistration { state_rx };
     Ok((Box::new(board), registration))
 }
@@ -955,5 +1069,108 @@ inventory::submit! {
         device_type: "s19j_pro_amlogic",
         name: BOARD_MODEL,
         create_fn: || Box::pin(create_amlogic_board()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AmlogicFanController;
+    use crate::{
+        api_client::types::TemperatureSensor,
+        config::{
+            AmlogicControlBoardConfig, AmlogicFanConfig, AmlogicHashboardConfig,
+            AmlogicHealthGateConfig, AmlogicPsuConfig, AmlogicStartupConfig,
+        },
+    };
+    use std::{path::PathBuf, time::Duration};
+
+    fn test_config() -> AmlogicControlBoardConfig {
+        AmlogicControlBoardConfig {
+            enabled: true,
+            board_name: Some("test".into()),
+            psu: AmlogicPsuConfig {
+                i2c_device: PathBuf::from("/dev/null"),
+                address: 0x10,
+                write_register: 0x11,
+                enable_gpio: 1,
+            },
+            startup: AmlogicStartupConfig {
+                default_fan_percent: 50,
+                fan_control: crate::config::AmlogicFanControlConfig {
+                    enabled: true,
+                    target_temp_c: 60.0,
+                    min_percent: 35,
+                    max_percent: 100,
+                    kp: 3.0,
+                    ki: 0.15,
+                    kd: 8.0,
+                    integral_limit: 200.0,
+                },
+                initial_voltage: 12.0,
+                psu_settle_ms: 100,
+                reset_assert_ms: 100,
+                reset_release_ms: 100,
+                health_gate: AmlogicHealthGateConfig {
+                    read_eeprom_before_mining: false,
+                    read_temperatures_before_mining: false,
+                    fail_on_missing_expected_hashboard: false,
+                },
+            },
+            fans: vec![AmlogicFanConfig {
+                index: 0,
+                pwm_chip: 0,
+                pwm_channel: 0,
+                tach_gpio: 1,
+                pulses_per_rev: 2,
+            }],
+            leds: None,
+            hashboards: vec![AmlogicHashboardConfig {
+                index: 2,
+                model: crate::config::HashboardModel::S19jPro,
+                serial_path: PathBuf::from("/dev/null"),
+                reset_gpio: 1,
+                detect_gpio: 2,
+                temp_i2c_device: PathBuf::from("/dev/null"),
+                temp_sensor_addresses: Vec::new(),
+                eeprom_i2c_device: PathBuf::from("/dev/null"),
+                eeprom_address: None,
+                required: false,
+            }],
+            gt_touch_display: None,
+        }
+    }
+
+    fn sensor(temp_c: f32) -> TemperatureSensor {
+        TemperatureSensor {
+            name: "temp".into(),
+            temperature_c: Some(temp_c),
+        }
+    }
+
+    #[test]
+    fn pid_falls_back_to_max_on_missing_temperature() {
+        let mut controller = AmlogicFanController::new(&test_config());
+
+        assert_eq!(controller.target_percent(&[], Duration::from_secs(2)), 100);
+    }
+
+    #[test]
+    fn pid_increases_fan_above_target_temperature() {
+        let mut controller = AmlogicFanController::new(&test_config());
+
+        assert_eq!(
+            controller.target_percent(&[sensor(70.0)], Duration::from_secs(2)),
+            80
+        );
+    }
+
+    #[test]
+    fn pid_respects_minimum_fan_floor_below_target_temperature() {
+        let mut controller = AmlogicFanController::new(&test_config());
+
+        assert_eq!(
+            controller.target_percent(&[sensor(35.0)], Duration::from_secs(2)),
+            35
+        );
     }
 }

@@ -44,6 +44,25 @@ fn min_viable_chip_count(expected: usize) -> usize {
     expected / 2
 }
 
+fn configured_target_frequency() -> protocol::Frequency {
+    const DEFAULT_TARGET_FREQ_MHZ: f32 = 500.0;
+
+    match std::env::var("MUJINA_TARGET_FREQ_MHZ") {
+        Ok(raw) => match raw.parse::<f32>() {
+            Ok(mhz) if mhz.is_finite() && mhz > 0.0 => protocol::Frequency::from_mhz(mhz),
+            Ok(_) | Err(_) => {
+                warn!(
+                    value = %raw,
+                    default_mhz = DEFAULT_TARGET_FREQ_MHZ,
+                    "Invalid MUJINA_TARGET_FREQ_MHZ; using default"
+                );
+                protocol::Frequency::from_mhz(DEFAULT_TARGET_FREQ_MHZ)
+            }
+        },
+        Err(_) => protocol::Frequency::from_mhz(DEFAULT_TARGET_FREQ_MHZ),
+    }
+}
+
 /// [`HashThread`] implementation for BM13xx ASIC chains.
 ///
 /// The scheduler uses this to dispatch mining work to BM13xx chips.
@@ -663,8 +682,8 @@ where
         self.execute_reg_config_perchip().await?;
 
         // 7. Ramp frequency to target (flat voltage throughout)
-        self.execute_frequency_ramp(protocol::Frequency::from_mhz(500.0))
-            .await?;
+        let target_frequency = configured_target_frequency();
+        self.execute_frequency_ramp(target_frequency).await?;
 
         self.chip_state = ChipState::Initialized;
         let status = self.update_status(|status| {

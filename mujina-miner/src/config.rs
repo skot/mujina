@@ -194,6 +194,10 @@ pub struct AmlogicStartupConfig {
     /// Default fan duty cycle applied before ASIC bring-up.
     pub default_fan_percent: u8,
 
+    /// Runtime fan control policy after bring-up completes.
+    #[serde(default)]
+    pub fan_control: AmlogicFanControlConfig,
+
     /// Initial PSU output voltage used for first BM1362 enumeration.
     ///
     /// This should be a low bring-up voltage. The BM13xx thread ramps the PSU
@@ -212,6 +216,50 @@ pub struct AmlogicStartupConfig {
 
     /// Health-gate policy applied before mining starts.
     pub health_gate: AmlogicHealthGateConfig,
+}
+
+/// Runtime fan-control policy for the native Amlogic board path.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AmlogicFanControlConfig {
+    /// Enable closed-loop fan control using the hashboard temperature sensors.
+    pub enabled: bool,
+
+    /// Desired maximum operating temperature in degrees Celsius.
+    pub target_temp_c: f32,
+
+    /// Minimum fan duty cycle the controller is allowed to command.
+    pub min_percent: u8,
+
+    /// Maximum fan duty cycle the controller is allowed to command.
+    pub max_percent: u8,
+
+    /// Proportional gain in percent per degree Celsius of error.
+    pub kp: f32,
+
+    /// Integral gain in percent per degree Celsius-second of accumulated error.
+    pub ki: f32,
+
+    /// Derivative gain in percent per degree Celsius per second of temperature change.
+    pub kd: f32,
+
+    /// Clamp for the integral accumulator to avoid wind-up.
+    pub integral_limit: f32,
+}
+
+impl Default for AmlogicFanControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_temp_c: 60.0,
+            min_percent: 35,
+            max_percent: 100,
+            kp: 3.0,
+            ki: 0.15,
+            kd: 8.0,
+            integral_limit: 200.0,
+        }
+    }
 }
 
 /// Pre-mining validation policy.

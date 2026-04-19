@@ -206,7 +206,16 @@ running.
 
 That HB2 config now targets the corrected native mapping for hashboard 2:
 `/dev/ttyS1` with reset GPIO `456`, detect GPIO `441`, TMP75 addresses
-`0x4C/0x48`, and EEPROM address `0x50`.
+`0x4E/0x4A` on `/dev/i2c-1`, and EEPROM address `0x52` on `/dev/i2c-1`.
+
+The Amlogic configs also support a `startup.fan_control` PID loop. The current
+S19j Pro profiles enable it with a `60C` target and duty-cycle clamps so the
+board can regulate fan speed from the TMP75 readings instead of staying fixed
+at the startup PWM percentage.
+
+`/home/root/start.sh` now sources `/home/root/mujina.env` first when present,
+so pool credentials, API bind address, and log level can be adjusted without
+editing the wrapper itself. A template lives at [`mujina.env.example`](mujina.env.example).
 
 ### GT Touch USB Display
 
