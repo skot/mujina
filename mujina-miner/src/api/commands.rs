@@ -13,6 +13,23 @@ pub enum SchedulerCommand {
 
     /// Resume job distribution after a pause.
     ResumeMining { reply: oneshot::Sender<Result<()>> },
+
+    /// Set the chip frequency (MHz) on every chain — the V1 power dial.
+    /// Each thread clamps to its safe runtime range and re-ramps its PLL.
+    SetFrequency {
+        mhz: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
+
+    /// Set the operating point (frequency + chain voltage) — M1.5. The
+    /// scheduler sequences frequency and the shared voltage in the order that
+    /// keeps the chips safe (lower frequency before lowering voltage; raise
+    /// voltage before raising frequency).
+    SetOperatingPoint {
+        mhz: f32,
+        volts: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Commands from the API to board management.

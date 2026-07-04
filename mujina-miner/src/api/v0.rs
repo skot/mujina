@@ -82,7 +82,42 @@ async fn patch_miner(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         // Result layers: timeout / channel-closed / command-error.
-        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(5), rx).await else {
+        // 5 minutes covers a full ResumeMining round-trip: the scheduler
+        // calls assign_job_to_threads -> handle_work_assignment ->
+        // initialize_chips on every hash thread, which includes a 500ms
+        // power-on wait, full enumeration, register config, and the
+        // BM1366 frequency ramp (typically ~2 min end-to-end). PauseMining
+        // is fast (just disable_chips) so this bound only matters on resume.
+        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(300), rx).await else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+    }
+
+    if let Some(volts) = req.target_voltage_v {
+        // Operating-point change (M1.5): voltage + frequency, applied in the
+        // V/f-safe order by the scheduler. Frequency is required alongside it.
+        let Some(mhz) = req.target_freq_mhz else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        let (tx, rx) = oneshot::channel();
+        state
+            .scheduler_cmd_tx
+            .send(SchedulerCommand::SetOperatingPoint { mhz, volts, reply: tx })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(120), rx).await else {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+    } else if let Some(mhz) = req.target_freq_mhz {
+        let (tx, rx) = oneshot::channel();
+        state
+            .scheduler_cmd_tx
+            .send(SchedulerCommand::SetFrequency { mhz, reply: tx })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        // A per-chain re-ramp at fixed voltage is fast (~seconds even across a
+        // few-hundred-MHz move), but allow generous slack for verify retries.
+        let Ok(Ok(Ok(()))) = tokio::time::timeout(Duration::from_secs(120), rx).await else {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         };
     }

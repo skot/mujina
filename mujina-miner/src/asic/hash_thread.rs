@@ -259,6 +259,45 @@ pub trait HashThread: Send {
     /// Thread enters low-power mode, stops hashing.
     async fn go_idle(&mut self) -> std::result::Result<Option<HashTask>, HashThreadError>;
 
+    /// Tell the thread the scheduler-level pause flag flipped.
+    ///
+    /// While paused the thread should:
+    ///   - immediately publish a zeroed `HashThreadStatus`
+    ///     (`hashrate = 0`, `is_active = false`) so the per-board UI
+    ///     stops showing pre-pause numbers
+    ///   - stop feeding its own hashrate estimator from incoming
+    ///     shares (chips may still emit nonces from the last loaded
+    ///     job, but the scheduler discards them via `handle_share`,
+    ///     so the per-thread display should match)
+    ///   - keep chips powered and ready — the soft pause we ship
+    ///     today doesn't reset chips, so resume can be instant
+    ///
+    /// Default impl is a no-op for thread backends (e.g. CPU miner)
+    /// that don't have a separate per-thread status display.
+    async fn set_paused(&mut self, _paused: bool) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
+
+    /// Runtime chip-frequency change in MHz — the V1 power dial.
+    ///
+    /// Re-ramps the chain's PLL from its current frequency to `mhz` at the
+    /// existing voltage (the implementation clamps to a safe range). Lowering
+    /// frequency lowers power; this is how an external controller dials the
+    /// miner's draw without stopping it.
+    ///
+    /// Default impl is a no-op for backends without frequency control (e.g.
+    /// the CPU miner), so they ignore the dial rather than erroring.
+    async fn set_frequency(&mut self, _mhz: f32) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
+
+    /// Runtime chain-voltage change in volts (M1.5). Sets the shared voltage
+    /// rail. The caller (scheduler) sequences this relative to `set_frequency`
+    /// for V/f safety. Default no-op for backends without a regulator.
+    async fn set_voltage(&mut self, _volts: f32) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
+
     /// Permanently shut down the thread, releasing hardware resources.
     ///
     /// This compensates for Rust's lack of async Drop. Callers must invoke

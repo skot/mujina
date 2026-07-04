@@ -82,6 +82,18 @@ pub struct ThreadState {
 pub struct MinerPatchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused: Option<bool>,
+
+    /// Target chip frequency in MHz — the V1 power dial. Clamped to the
+    /// miner's safe runtime range and applied to every chain by re-ramping
+    /// the PLL at the existing voltage. `None` leaves frequency unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_freq_mhz: Option<f32>,
+
+    /// Target chain voltage in volts (M1.5). When set, the request is applied
+    /// as an operating-point change (`target_freq_mhz` must also be set): the
+    /// miner sequences frequency and voltage in the V/f-safe order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_voltage_v: Option<f32>,
 }
 
 /// Request body for setting a fan's target duty cycle.
