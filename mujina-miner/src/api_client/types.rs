@@ -12,8 +12,12 @@ use utoipa::ToSchema;
 #[derive(Clone, Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct MinerState {
     pub uptime_secs: u64,
-    /// Aggregate hashrate in hashes per second.
+    /// Aggregate hashrate in hashes per second (5-minute window).
     pub hashrate: u64,
+    /// Aggregate hashrate over the responsive 1-minute window (hashes per
+    /// second) — settles ~5× faster than `hashrate` after a power dial.
+    #[serde(default)]
+    pub hashrate_1min: u64,
     pub shares_submitted: u64,
     /// Best share difficulty observed since startup, if any shares were found.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,9 +72,26 @@ pub struct PowerMeasurement {
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ThreadState {
     pub name: String,
-    /// Hashrate in hashes per second.
+    /// Hashrate in hashes per second (5-minute window).
     pub hashrate: u64,
+    /// Responsive hashrate over a 1-minute window (hashes per second). Reflects
+    /// an operating-point change ~5× faster than `hashrate`. 0 on older builds.
+    #[serde(default)]
+    pub hashrate_1min: u64,
     pub is_active: bool,
+    /// Distinct chips that have produced a nonce within the recent census
+    /// window (passive, derived from the nonce stream). Pair with
+    /// `expected_chips` to distinguish "some chips gone silent" from a uniform
+    /// per-chip throughput drop.
+    #[serde(default)]
+    pub active_chips: u16,
+    /// Total chips expected on this chain.
+    #[serde(default)]
+    pub expected_chips: u16,
+    /// Current chip frequency (MHz) applied to this chain — the live operating
+    /// point of the power dial. 0 when idle/paused.
+    #[serde(default)]
+    pub frequency_mhz: f32,
 }
 
 /// Writable fields for `PATCH /api/v0/miner`.
@@ -82,6 +103,18 @@ pub struct ThreadState {
 pub struct MinerPatchRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused: Option<bool>,
+
+    /// Target chip frequency in MHz — the V1 power dial. Clamped to the
+    /// miner's safe runtime range and applied to every chain by re-ramping
+    /// the PLL at the existing voltage. `None` leaves frequency unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_freq_mhz: Option<f32>,
+
+    /// Target chain voltage in volts (M1.5). When set, the request is applied
+    /// as an operating-point change (`target_freq_mhz` must also be set): the
+    /// miner sequences frequency and voltage in the V/f-safe order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_voltage_v: Option<f32>,
 }
 
 /// Request body for setting a fan's target duty cycle.

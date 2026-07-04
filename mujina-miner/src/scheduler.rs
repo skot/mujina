@@ -71,6 +71,8 @@ type ShareStream = StreamMap<TaskId, ReceiverStream<Share>>;
 
 /// Window duration for per-thread hashrate estimation.
 const HASHRATE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Shorter window for the responsive top-level `hashrate_1min`.
+const HASHRATE_WINDOW_1MIN: Duration = Duration::from_secs(60);
 
 /// Per-thread measurement floor: minimum share rate for hashrate
 /// estimation (1 share/sec).
@@ -160,6 +162,9 @@ enum AssignMode {
 struct ThreadEntry {
     thread: Box<dyn HashThread>,
     hashrate: HashrateEstimator,
+    /// Same shares over a 1-minute window, driving the responsive top-level
+    /// `hashrate_1min` (settles ~5× faster than `hashrate` after a power dial).
+    hashrate_1min: HashrateEstimator,
 }
 
 /// Core scheduler state.
@@ -185,6 +190,51 @@ struct Scheduler {
 
     /// Mining paused
     paused: bool,
+
+    /// Last commanded chain voltage (V), tracked so `SetOperatingPoint` can
+    /// pick the safe V/f ordering. Seeded to the factory cold-init setpoint and
+    /// reset there on resume (a cold-init returns the rail to factory voltage).
+    current_voltage_v: f32,
+}
+
+/// Factory cold-init chain voltage (V) — the rail's value after any cold init.
+const COLD_INIT_VOLTAGE_V: f32 = 13.9;
+
+/// Upper bound on how long a single thread's `set_frequency`/`set_voltage` may
+/// take before the scheduler gives up on it. A full-range PLL re-ramp is ~8 s
+/// per chain, so 30 s is generous headroom. The guard exists so a wedged chip
+/// bus (a chain that stops accepting UART mid-ramp and never replies) can never
+/// hang the scheduler — and therefore the whole HTTP/control plane — forever.
+/// On timeout we log, surface it as a per-op error, and move on; the stuck
+/// chain shows up as ~0 board hashrate rather than freezing every surface.
+const THREAD_OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fold the outcome of a [`THREAD_OP_TIMEOUT`]-wrapped thread op into
+/// `last_err`, logging failures and timeouts uniformly. A timeout means the
+/// chain stopped replying (most likely a wedged chip bus mid-ramp); we record
+/// it and let the scheduler keep serving every other command and surface.
+fn guard_thread_op<K: std::fmt::Debug, E: std::fmt::Display>(
+    outcome: Result<Result<(), E>, tokio::time::error::Elapsed>,
+    id: K,
+    op: &str,
+    last_err: &mut Option<String>,
+) {
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(thread_id = ?id, op, error = %e, "thread op failed");
+            *last_err = Some(e.to_string());
+        }
+        Err(_) => {
+            warn!(
+                thread_id = ?id,
+                op,
+                timeout_s = THREAD_OP_TIMEOUT.as_secs(),
+                "thread op timed out — chain unresponsive, skipping"
+            );
+            *last_err = Some(format!("{op} timed out"));
+        }
+    }
 }
 
 impl Scheduler {
@@ -196,6 +246,7 @@ impl Scheduler {
             stats: MiningStats::default(),
             last_thread_count: 0,
             paused: false,
+            current_voltage_v: COLD_INIT_VOLTAGE_V,
         }
     }
 
@@ -206,6 +257,14 @@ impl Scheduler {
         self.threads
             .values_mut()
             .map(|entry| entry.hashrate.hashrate())
+            .sum()
+    }
+
+    /// Aggregate measured hashrate over the responsive 1-minute window.
+    fn measured_hashrate_1min(&mut self) -> HashRate {
+        self.threads
+            .values_mut()
+            .map(|entry| entry.hashrate_1min.hashrate())
             .sum()
     }
 
@@ -236,6 +295,7 @@ impl Scheduler {
         MinerState {
             uptime_secs: self.stats.start_time.elapsed().as_secs(),
             hashrate: u64::from(self.measured_hashrate()),
+            hashrate_1min: u64::from(self.measured_hashrate_1min()),
             shares_submitted: self.stats.shares_submitted,
             best_difficulty: self.stats.best_difficulty,
             paused: self.paused,
@@ -369,6 +429,15 @@ impl Scheduler {
             return;
         }
 
+        // Skip assignment if mining is paused via API. The template is
+        // still stored on `source.last_job` above so `resume_mining` can
+        // re-dispatch it without waiting for the source to emit a new
+        // job. Threads stay idle (chips disabled) until then.
+        if self.paused {
+            debug!(source = %source_name, "Mining is paused; caching job for resume");
+            return;
+        }
+
         // Debounced difficulty warning
         let hashrate = self.operational_hashrate();
         if let Some(source) = self.sources.get_mut(source_id) {
@@ -468,6 +537,16 @@ impl Scheduler {
 
     /// Handle a share arriving from a task's channel.
     async fn handle_share(&mut self, task_id: TaskId, share: Share) {
+        // When paused, drop everything. Chips keep mining the last job
+        // we sent them and will keep emitting nonces; if we forwarded
+        // them, the pool would see hashrate even though the user
+        // pressed pause. Stop counting them toward the per-thread
+        // hashrate estimator too so the UI reads 0 TH/s.
+        if self.paused {
+            trace!(?task_id, "Share dropped — scheduler is paused");
+            return;
+        }
+
         // Look up task context for routing
         let Some(task_entry) = self.tasks.get(task_id) else {
             // Task was removed (ReplaceJob/ClearJobs) but share arrived
@@ -503,6 +582,7 @@ impl Scheduler {
         // Feed share work to per-thread hashrate estimator
         if let Some(entry) = self.threads.get_mut(task_entry.thread_id) {
             entry.hashrate.record(share.expected_work);
+            entry.hashrate_1min.record(share.expected_work);
         }
 
         // Check if share meets source threshold
@@ -588,6 +668,7 @@ impl Scheduler {
         let thread_id = self.threads.insert(ThreadEntry {
             thread,
             hashrate: HashrateEstimator::new(HASHRATE_WINDOW),
+            hashrate_1min: HashrateEstimator::new(HASHRATE_WINDOW_1MIN),
         });
         thread_events.insert(thread_id, ReceiverStream::new(event_rx));
         debug!(thread = %thread_name, "Thread registered");
@@ -618,7 +699,13 @@ impl Scheduler {
                 .unwrap_or(entry.thread.capabilities().hashrate_estimate)
         };
 
-        // Assign cached jobs from all sources to the new thread
+        // Assign cached jobs from all sources to the new thread — but
+        // only if the scheduler isn't paused. If it is, the thread joins
+        // the paused pool and stays idle until `resume_mining` fires.
+        if self.paused {
+            debug!(thread = %thread_name, "Mining is paused; new thread will stay idle");
+            return;
+        }
         for (source_id, source) in self.sources.iter() {
             let Some(template) = &source.last_job else {
                 continue;
@@ -709,23 +796,182 @@ impl Scheduler {
     ///
     /// Publishes an updated state snapshot before replying so the API
     /// handler's subsequent `borrow()` sees the new value.
-    fn handle_api_command(
+    async fn handle_api_command(
         &mut self,
         cmd: SchedulerCommand,
         miner_state_tx: &watch::Sender<MinerState>,
+        share_channels: &mut ShareStream,
     ) {
         match cmd {
             SchedulerCommand::PauseMining { reply } => {
-                self.paused = true;
-                warn!("Mining paused via API (not yet implemented)");
+                if !self.paused {
+                    self.paused = true;
+                    info!(
+                        thread_count = self.threads.len(),
+                        "Mining paused — share submissions and new job dispatch stopped"
+                    );
+                    // Tell every hash thread so its own status (per-board
+                    // hashrate + is_active) zeroes immediately, instead
+                    // of carrying pre-pause numbers in the UI.
+                    for (id, entry) in self.threads.iter_mut() {
+                        if let Err(e) = entry.thread.set_paused(true).await {
+                            warn!(thread_id = ?id, thread = %entry.thread.name(), error = %e, "set_paused(true) failed");
+                        }
+                    }
+                    // Soft pause: drop any in-flight task on each hash
+                    // thread but DON'T touch the chip power rail. Chips
+                    // burn through whatever nonces are still queued on
+                    // their last job, mujina drops every share that
+                    // comes back (`assign_job_to_threads` is gated on
+                    // `!self.paused`, and the task lookup in
+                    // `handle_share` only matches templates we still
+                    // have entries for; clearing `current_task` on the
+                    // hash thread stops ntime rolling so the chip work
+                    // staleness curve takes over within a minute).
+                    //
+                    // Hard pause (full asic_enable.disable() + chip
+                    // power cycle) is broken on BHB56902 today because
+                    // the post-reset re-enumeration only sees ~half the
+                    // chain at 115200 — likely a chain-RST_N propagation
+                    // issue with our reset_release_ms timing. Left as a
+                    // follow-up; tracked in the TODO below.
+                    for (id, entry) in self.threads.iter_mut() {
+                        // Reset the per-thread hashrate estimator so the
+                        // API/UI stops showing the pre-pause hashrate
+                        // while the window ages out.
+                        entry.hashrate = HashrateEstimator::new(HASHRATE_WINDOW);
+                        entry.hashrate_1min = HashrateEstimator::new(HASHRATE_WINDOW_1MIN);
+                        debug!(thread_id = ?id, thread = %entry.thread.name(), "Thread marked paused");
+                    }
+                    // Note: we intentionally do NOT call
+                    // `thread.go_idle()` here. That triggers
+                    // disable_chips() which has the reset-baud
+                    // recovery problem; until that's debugged we leave
+                    // chips warm and rely on `self.paused` gating in
+                    // `assign_job_to_threads` to stop new work.
+                } else {
+                    debug!("PauseMining received but scheduler is already paused");
+                }
                 let _ = miner_state_tx.send(self.compute_miner_state());
                 let _ = reply.send(Ok(()));
             }
             SchedulerCommand::ResumeMining { reply } => {
-                self.paused = false;
-                warn!("Mining resumed via API (not yet implemented)");
+                if self.paused {
+                    self.paused = false;
+                    // A resume cold-inits the chains, returning the rail to the
+                    // factory voltage — re-seed the tracker so the next
+                    // SetOperatingPoint picks the right V/f ordering.
+                    self.current_voltage_v = COLD_INIT_VOLTAGE_V;
+                    info!(
+                        thread_count = self.threads.len(),
+                        "Mining resumed — re-dispatching cached jobs"
+                    );
+                    // Tell every thread to start feeding its own status
+                    // hashrate again. assign_job_to_threads below will
+                    // also re-dispatch cached work so shares start
+                    // flowing back.
+                    for (id, entry) in self.threads.iter_mut() {
+                        if let Err(e) = entry.thread.set_paused(false).await {
+                            warn!(thread_id = ?id, thread = %entry.thread.name(), error = %e, "set_paused(false) failed");
+                        }
+                    }
+                    // Snapshot the latest job per source. We can't iterate
+                    // `self.sources` while calling `assign_job_to_threads`
+                    // (which borrows `&mut self`), so collect first.
+                    let jobs_to_redispatch: Vec<(SourceId, JobTemplate)> = self
+                        .sources
+                        .iter()
+                        .filter_map(|(id, source)| {
+                            source.last_job.as_ref().map(|t| (id, t.as_ref().clone()))
+                        })
+                        .collect();
+                    for (source_id, template) in jobs_to_redispatch {
+                        self.assign_job_to_threads(
+                            AssignMode::Replace,
+                            source_id,
+                            template,
+                            share_channels,
+                        )
+                        .await;
+                    }
+                } else {
+                    debug!("ResumeMining received but scheduler is not paused");
+                }
                 let _ = miner_state_tx.send(self.compute_miner_state());
                 let _ = reply.send(Ok(()));
+            }
+            SchedulerCommand::SetFrequency { mhz, reply } => {
+                info!(
+                    mhz,
+                    thread_count = self.threads.len(),
+                    "Setting chip frequency on all chains (power dial)"
+                );
+                // Per-chain re-ramp at fixed voltage. Each thread clamps to
+                // its own safe range. Collect the last error (if any) so the
+                // HTTP caller learns it didn't fully apply.
+                let mut last_err: Option<String> = None;
+                for (id, entry) in self.threads.iter_mut() {
+                    guard_thread_op(
+                        tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
+                        id, "set_frequency", &mut last_err,
+                    );
+                }
+                let _ = miner_state_tx.send(self.compute_miner_state());
+                let _ = reply.send(match last_err {
+                    Some(e) => Err(anyhow::anyhow!(e)),
+                    None => Ok(()),
+                });
+            }
+            SchedulerCommand::SetOperatingPoint { mhz, volts, reply } => {
+                let lowering_voltage = volts < self.current_voltage_v;
+                info!(
+                    mhz,
+                    volts,
+                    from_volts = self.current_voltage_v,
+                    lowering_voltage,
+                    "Setting operating point (V/f) on all chains"
+                );
+
+                // V/f safety ordering. Frequency is per-chain; the voltage rail
+                // is shared, so setting it on any one chain moves the whole
+                // board (the rest are no-ops). The two sequential loops give
+                // the ordering: never a high frequency at a low voltage.
+                //   - lowering power: ALL chains drop frequency, THEN voltage.
+                //   - raising power:  voltage up, THEN ALL chains raise freq.
+                let mut last_err: Option<String> = None;
+                if lowering_voltage {
+                    for (id, entry) in self.threads.iter_mut() {
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
+                            id, "set_frequency", &mut last_err,
+                        );
+                    }
+                    for (id, entry) in self.threads.iter_mut() {
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_voltage(volts)).await,
+                            id, "set_voltage", &mut last_err,
+                        );
+                    }
+                } else {
+                    for (id, entry) in self.threads.iter_mut() {
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_voltage(volts)).await,
+                            id, "set_voltage", &mut last_err,
+                        );
+                    }
+                    for (id, entry) in self.threads.iter_mut() {
+                        guard_thread_op(
+                            tokio::time::timeout(THREAD_OP_TIMEOUT, entry.thread.set_frequency(mhz)).await,
+                            id, "set_frequency", &mut last_err,
+                        );
+                    }
+                }
+                self.current_voltage_v = volts;
+                let _ = miner_state_tx.send(self.compute_miner_state());
+                let _ = reply.send(match last_err {
+                    Some(e) => Err(anyhow::anyhow!(e)),
+                    None => Ok(()),
+                });
             }
         }
     }
@@ -829,7 +1075,7 @@ impl Scheduler {
 
                 // API commands
                 Some(cmd) = cmd_rx.recv() => {
-                    self.handle_api_command(cmd, &miner_state_tx);
+                    self.handle_api_command(cmd, &miner_state_tx, &mut share_channels).await;
                 }
 
                 // Periodic state publishing and hashrate broadcast

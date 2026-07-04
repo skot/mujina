@@ -55,8 +55,13 @@ pub struct HashThreadCapabilities {
 /// Current runtime status of a HashThread.
 #[derive(Debug, Clone, Default)]
 pub struct HashThreadStatus {
-    /// Current hashrate estimate
+    /// Current hashrate estimate (5-minute window)
     pub hashrate: HashRate,
+
+    /// Responsive hashrate estimate over a 1-minute window. Reflects an
+    /// operating-point change (frequency dial, recovery) in ~1 min vs the
+    /// ~5 min the primary `hashrate` takes to catch up.
+    pub hashrate_1min: HashRate,
 
     /// Number of shares found (at chip target level, before pool filtering)
     pub chip_shares_found: u64,
@@ -72,6 +77,21 @@ pub struct HashThreadStatus {
 
     /// Whether thread is actively working
     pub is_active: bool,
+
+    /// Number of distinct chips that have produced a nonce within the recent
+    /// census window, derived passively from the nonce stream (each nonce
+    /// encodes its origin chip). Lets the API/UI show "chips producing" so a
+    /// degraded chain (some chips gone silent) is distinguishable from a
+    /// uniform per-chip throughput drop. 0 until enough nonces are sampled.
+    pub active_chips: u16,
+
+    /// Total chips expected on this chain (from the chain topology). Pair with
+    /// `active_chips` as "active/expected".
+    pub expected_chips: u16,
+
+    /// Current chip frequency (MHz) actually applied to this chain — the live
+    /// operating point of the power dial. 0 when idle/paused.
+    pub frequency_mhz: f32,
 }
 
 /// Events emitted by HashThreads back to the scheduler.
@@ -258,6 +278,45 @@ pub trait HashThread: Send {
     /// Returns the current task if thread was working (None if already idle).
     /// Thread enters low-power mode, stops hashing.
     async fn go_idle(&mut self) -> std::result::Result<Option<HashTask>, HashThreadError>;
+
+    /// Tell the thread the scheduler-level pause flag flipped.
+    ///
+    /// While paused the thread should:
+    ///   - immediately publish a zeroed `HashThreadStatus`
+    ///     (`hashrate = 0`, `is_active = false`) so the per-board UI
+    ///     stops showing pre-pause numbers
+    ///   - stop feeding its own hashrate estimator from incoming
+    ///     shares (chips may still emit nonces from the last loaded
+    ///     job, but the scheduler discards them via `handle_share`,
+    ///     so the per-thread display should match)
+    ///   - keep chips powered and ready — the soft pause we ship
+    ///     today doesn't reset chips, so resume can be instant
+    ///
+    /// Default impl is a no-op for thread backends (e.g. CPU miner)
+    /// that don't have a separate per-thread status display.
+    async fn set_paused(&mut self, _paused: bool) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
+
+    /// Runtime chip-frequency change in MHz — the V1 power dial.
+    ///
+    /// Re-ramps the chain's PLL from its current frequency to `mhz` at the
+    /// existing voltage (the implementation clamps to a safe range). Lowering
+    /// frequency lowers power; this is how an external controller dials the
+    /// miner's draw without stopping it.
+    ///
+    /// Default impl is a no-op for backends without frequency control (e.g.
+    /// the CPU miner), so they ignore the dial rather than erroring.
+    async fn set_frequency(&mut self, _mhz: f32) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
+
+    /// Runtime chain-voltage change in volts (M1.5). Sets the shared voltage
+    /// rail. The caller (scheduler) sequences this relative to `set_frequency`
+    /// for V/f safety. Default no-op for backends without a regulator.
+    async fn set_voltage(&mut self, _volts: f32) -> std::result::Result<(), HashThreadError> {
+        Ok(())
+    }
 
     /// Permanently shut down the thread, releasing hardware resources.
     ///
