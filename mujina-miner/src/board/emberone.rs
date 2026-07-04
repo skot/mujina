@@ -383,7 +383,10 @@ impl Board for EmberOne {
                     io_power_enable_pin,
                 })),
                 voltage_regulator,
+                chip_uart_baud: None,
+                ramp_coordinator: None,
             },
+            post_broadcast_chip_baud: None,
         };
 
         // Create the hash thread
