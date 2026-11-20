@@ -33,10 +33,48 @@ const HCI_DEV_ID: u16 = 0; // hci0
 const PAGE_FILE: &str = "/mntapp/release/linux/app/fb_page";
 const BLE_WIFI_STATUS_FILE: &str = "/tmp/ble_wifi_status.txt";
 
+fn atomic_write_str(path: &str, content: &str) -> std::io::Result<()> {
+    let p = std::path::Path::new(path);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = format!("{path}.tmp");
+    let mut f = std::fs::File::create(&tmp_path)?;
+    std::io::Write::write_all(&mut f, content.as_bytes())?;
+    let _ = f.sync_all();
+    std::fs::rename(&tmp_path, p)
+}
+
 fn set_display_page(page: &str) {
-    if let Err(e) = std::fs::write(PAGE_FILE, page) {
+    if let Err(e) = atomic_write_str(PAGE_FILE, page) {
         eprintln!("step: failed to write {PAGE_FILE}: {e}");
     }
+}
+
+fn restore_display_page_in_file(path: &str) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(curr) if curr.trim() == "wifi-setup" => {
+            if let Err(e) = atomic_write_str(path, "nano3s") {
+                eprintln!("step: failed to restore {path}: {e}");
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+fn restore_display_page_if_wifi_setup() {
+    if restore_display_page_in_file(PAGE_FILE) {
+        eprintln!("step: restored display page from wifi-setup to nano3s");
+    }
+}
+
+fn has_configured_wifi() -> bool {
+    std::fs::read_to_string("/data/userconfig/wpa_supplicant.conf")
+        .map(|s| s.contains("ssid="))
+        .unwrap_or(false)
 }
 
 /// Writes BLE_WIFI_STATUS_FILE for nano3s_ui's "wifi-setup" page to
@@ -45,7 +83,7 @@ fn set_display_page(page: &str) {
 /// refresh_wifi_setup() for exactly how each maps to on-screen text).
 fn write_wifi_status(state: &str, detail: &str) {
     let body = format!("state={state}\ndetail={detail}\n");
-    if let Err(e) = std::fs::write(BLE_WIFI_STATUS_FILE, body) {
+    if let Err(e) = atomic_write_str(BLE_WIFI_STATUS_FILE, &body) {
         eprintln!("step: failed to write {BLE_WIFI_STATUS_FILE}: {e}");
     }
 }
@@ -274,13 +312,23 @@ fn main() {
     // effect more simply by never starting it in the first place once
     // already connected, rechecked every 60s via the sleep+exit below.
     let force_advertise = std::env::var("BLE_SETUP_FORCE_ADVERTISE").as_deref() == Ok("1");
+    if !force_advertise && ifconfig_wlan0_ip().is_none() && has_configured_wifi() {
+        eprintln!("step: wpa_supplicant.conf exists; waiting up to 15s for wlan0 IP before BLE setup");
+        for _ in 0..15 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if ifconfig_wlan0_ip().is_some() {
+                break;
+            }
+        }
+    }
     if let Some(ip) = ifconfig_wlan0_ip() {
-        if force_advertise {
-            eprintln!("step: wlan0 connected (ip={ip}) but BLE_SETUP_FORCE_ADVERTISE=1, advertising anyway");
-        } else {
-            eprintln!("step: wlan0 already connected (ip={ip}), not advertising; idling before recheck");
+        if !force_advertise {
+            restore_display_page_if_wifi_setup();
+            eprintln!("step: wlan0 connected (ip={ip}), not advertising; idling before recheck");
             std::thread::sleep(std::time::Duration::from_secs(60));
             return;
+        } else {
+            eprintln!("step: wlan0 connected (ip={ip}) but BLE_SETUP_FORCE_ADVERTISE=1; continuing BLE advertising");
         }
     }
 
@@ -341,7 +389,8 @@ const UUID_CHARACTERISTIC: u16 = 0x2803;
 const UUID_SERVICE_FFFF: u16 = 0xFFFF;
 const UUID_CHAR_FFE1: u16 = 0xFFE1; // read: wifi scan results
 const UUID_CHAR_FFE2: u16 = 0xFFE2; // write: commands
-const UUID_CHAR_FFE3: u16 = 0xFFE3; // read: JSON status
+const UUID_CHAR_FFE3: u16 = 0xFFE3;
+const UUID_DEVICE_NAME: u16 = 0x2A00; // read: JSON status
 
 const CHR_PROP_READ: u8 = 0x02;
 const CHR_PROP_WRITE_NO_RSP: u8 = 0x04;
@@ -423,38 +472,11 @@ fn attr_lookup(handle: u16, state: &GattState) -> Option<(u16, Vec<u8>)> {
     match handle {
         H_SERVICE => Some((UUID_PRIMARY_SERVICE, UUID_SERVICE_FFFF.to_le_bytes().to_vec())),
         H_CHAR1_DECL => Some((UUID_CHARACTERISTIC, char_decl_value(CHR_PROP_READ, H_CHAR1_VAL, UUID_CHAR_FFE1))),
-        H_CHAR1_VAL => Some((UUID_CHAR_FFE1, state.ffe1_value.clone())),
-        // Also advertises READ (not just WRITE/WRITE_NO_RSP): the real
-        // Avalon Family app's BleService builds a *separate* index list
-        // per property (readCharacteristicUUIDs, writeWithResponse...,
-        // etc), each populated in characteristic-discovery order, and
-        // reads by a hardcoded index that differs between platforms --
-        // confirmed from the app's own GPL-3.0 source
-        // (Canaan-Creative/avalon_family): iOS reads wifi-scan-results
-        // at index 0 (FFE1, already correct) and status at index 1;
-        // Android reads wifi-scan-results at index 1 and status at
-        // index 2. With exactly 3 read-capable characteristics (FFE1,
-        // FFE2, FFE3) in this fixed order, index 1 is FFE2 -- which
-        // Android's WiFi-scan read and iOS's status read both land on,
-        // wanting *different* content. Restructuring the GATT layout
-        // (e.g. adding a 4th read-capable entry ahead of FFE1) shifts
-        // every index and was tried -- it fixed Android's index-1 read
-        // but broke iOS's index-0 read, which depends on there being
-        // nothing ahead of FFE1. So instead of changing structure,
-        // FFE2's read content mirrors FFE1's (the actual wifi scan
-        // results) below: this fixes Android's WiFi list (its real,
-        // actively-blocking bug -- you can't proceed with setup at all
-        // if the network list never populates) without touching the
-        // three characteristics' handles/properties/order at all, so
-        // iOS's WiFi-list read (index 0, still FFE1) is untouched.
-        // iOS's status read (index 1) still won't get real status JSON
-        // this way, but that was already broken/unreliable before this
-        // change (see the module doc comment -- the on-device LCD is
-        // the real status source of truth, not the app's own UI).
+        H_CHAR1_VAL | 0x0009 => Some((UUID_CHAR_FFE1, state.ffe1_value.clone())),
         H_CHAR2_DECL => Some((UUID_CHARACTERISTIC, char_decl_value(CHR_PROP_READ | CHR_PROP_WRITE | CHR_PROP_WRITE_NO_RSP, H_CHAR2_VAL, UUID_CHAR_FFE2))),
-        H_CHAR2_VAL => Some((UUID_CHAR_FFE2, state.ffe1_value.clone())),
+        H_CHAR2_VAL | 0x000B => Some((UUID_CHAR_FFE2, state.ffe1_value.clone())),
         H_CHAR3_DECL => Some((UUID_CHARACTERISTIC, char_decl_value(CHR_PROP_READ, H_CHAR3_VAL, UUID_CHAR_FFE3))),
-        H_CHAR3_VAL => Some((UUID_CHAR_FFE3, state.ffe3_value.clone())),
+        H_CHAR3_VAL | 0x000D => Some((UUID_CHAR_FFE3, state.ffe3_value.clone())),
         _ => None,
     }
 }
@@ -536,6 +558,16 @@ fn handle_read_by_type(fd: i32, conn_handle: u16, req: &[u8], state: &Arc<Mutex<
         return;
     }
 
+    if attr_type == UUID_DEVICE_NAME {
+        let name_bytes = state.device_name.as_bytes();
+        let entry_len = 2 + name_bytes.len();
+        let mut payload = vec![ATT_OP_READ_BY_TYPE_RSP, entry_len as u8];
+        payload.extend_from_slice(&H_CHAR1_VAL.to_le_bytes());
+        payload.extend_from_slice(name_bytes);
+        send_l2cap(fd, conn_handle, ATT_CID, &payload);
+        return;
+    }
+
     // Any other "read by type" (e.g. probing for specific descriptor
     // UUIDs by type) -- we have none, report not found.
     att_error(fd, conn_handle, ATT_OP_READ_BY_TYPE_REQ, start, ATT_ECODE_ATTRIBUTE_NOT_FOUND);
@@ -606,12 +638,7 @@ fn handle_write(fd: i32, conn_handle: u16, req: &[u8], state: &Arc<Mutex<GattSta
     }
     let handle = u16::from_le_bytes([req[1], req[2]]);
     let value = &req[3..];
-    if handle != H_CHAR2_VAL {
-        if with_response {
-            att_error(fd, conn_handle, ATT_OP_WRITE_REQ, handle, ATT_ECODE_WRITE_NOT_PERMITTED);
-        }
-        return;
-    }
+    eprintln!("step: ATT write handle=0x{handle:04x} len={} bytes={:02x?}", value.len(), &value[..value.len().min(16)]);
     if with_response {
         send_l2cap(fd, conn_handle, ATT_CID, &[ATT_OP_WRITE_RSP]);
     }
@@ -673,14 +700,16 @@ fn hex_decode(s: &str) -> Option<String> {
 /// processing.
 fn dispatch_command(cmd: &[u8], state: &Arc<Mutex<GattState>>) {
     let text = String::from_utf8_lossy(cmd);
-    eprintln!("step: command received: {text:?}");
-    let mut parts = text.split(',');
-    match parts.next() {
-        Some("scan") => run_wifi_scan(state),
-        Some("setssid") => {
-            let hex_ssid = parts.next().unwrap_or("");
-            let hex_pass = parts.next().unwrap_or("");
-            let hex_id = parts.next().unwrap_or("");
+    let clean = text.trim();
+    eprintln!("step: command received: {clean:?}");
+    let mut parts = clean.split(',');
+    let action = parts.next().map(|s| s.trim().to_lowercase()).unwrap_or_default();
+    match action.as_str() {
+        "scan" => run_wifi_scan(state),
+        "setssid" => {
+            let hex_ssid = parts.next().unwrap_or("").trim();
+            let hex_pass = parts.next().unwrap_or("").trim();
+            let hex_id = parts.next().unwrap_or("").trim();
             let auth: i32 = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
             let ssid = hex_decode(hex_ssid).unwrap_or_default();
             let pass = hex_decode(hex_pass).unwrap_or_default();
@@ -688,45 +717,199 @@ fn dispatch_command(cmd: &[u8], state: &Arc<Mutex<GattState>>) {
             eprintln!("step: setssid ssid={ssid:?} auth={auth} identity={identity:?} (password redacted)");
             apply_wifi_credentials(&ssid, &pass, auth, state);
         }
-        _ => eprintln!("step: unknown command: {text:?}"),
+        _ => eprintln!("step: unknown command: {clean:?}"),
     }
 }
 
-fn run_wifi_scan(state: &Arc<Mutex<GattState>>) {
-    // wpa_supplicant is already managing wlan0 (STA mode); ask it to
-    // trigger a scan and read cached results back, rather than fighting
-    // it for the interface with a separate iwlist/iw call.
-    let _ = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan"]).status();
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let out = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan_results"]).output();
-    let mut entries = Vec::new();
-    if let Ok(out) = out {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines().skip(1) {
-            // wpa_cli scan_results columns: bssid / frequency / signal level / flags / ssid
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() < 5 {
-                continue;
+struct WifiScanEntry {
+    ssid: String,
+    auth: i32,
+    rssi: i32,
+}
+
+fn parse_iwlist_scan(text: &str) -> Vec<String> {
+    let mut entries: Vec<WifiScanEntry> = Vec::new();
+    let mut cur_ssid: Option<String> = None;
+    let mut cur_rssi: i32 = -100;
+    let mut cur_has_wpa2 = false;
+    let mut cur_has_wpa = false;
+
+    let flush_cell = |entries: &mut Vec<WifiScanEntry>,
+                          ssid: &mut Option<String>,
+                          rssi: &mut i32,
+                          has_wpa2: &mut bool,
+                          has_wpa: &mut bool| {
+        if let Some(s) = ssid.take() {
+            if !s.is_empty() && s != "\\x00" {
+                let auth = if *has_wpa2 {
+                    7
+                } else if *has_wpa {
+                    5
+                } else {
+                    1
+                };
+                if let Some(existing) = entries.iter_mut().find(|e| e.ssid == s) {
+                    if *rssi > existing.rssi {
+                        existing.rssi = *rssi;
+                        existing.auth = auth;
+                    }
+                } else {
+                    entries.push(WifiScanEntry {
+                        ssid: s,
+                        auth,
+                        rssi: *rssi,
+                    });
+                }
             }
-            let ssid = cols[4];
-            if ssid.is_empty() {
-                continue;
+        }
+        *rssi = -100;
+        *has_wpa2 = false;
+        *has_wpa = false;
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Cell ") {
+            flush_cell(&mut entries, &mut cur_ssid, &mut cur_rssi, &mut cur_has_wpa2, &mut cur_has_wpa);
+        }
+
+        if let Some(idx) = trimmed.find("ESSID:\"") {
+            let after = &trimmed[idx + 7..];
+            if let Some(end) = after.rfind('"') {
+                cur_ssid = Some(after[..end].to_string());
             }
-            let rssi: i32 = cols[2].parse().unwrap_or(-100);
-            let flags = cols[3];
-            let auth = if flags.contains("WPA2") {
-                7
-            } else if flags.contains("WPA") {
-                5
-            } else {
-                1
-            };
-            entries.push(format!("{},{},{}", hex::encode(ssid), auth, rssi));
+        }
+
+        if trimmed.contains("Signal level") {
+            if let Some(pos) = trimmed.find("Signal level") {
+                let sub = &trimmed[pos + 12..];
+                let s = sub.trim_start_matches(|c| c == '=' || c == ':' || c == ' ');
+                if let Some(token) = s.split_whitespace().next() {
+                    let cleaned = token.trim_end_matches("dBm").trim_end_matches("dbm");
+                    if let Ok(val) = cleaned.parse::<i32>() {
+                        cur_rssi = val;
+                    } else if let Some((num, den)) = cleaned.split_once('/') {
+                        if let (Ok(n), Ok(d)) = (num.parse::<f32>(), den.parse::<f32>()) {
+                            if d > 0.0 {
+                                cur_rssi = (-100.0 + (n / d) * 70.0).round() as i32;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if cur_rssi == -100 && trimmed.contains("Quality") {
+            if let Some(pos) = trimmed.find("Quality") {
+                let sub = &trimmed[pos + 7..];
+                let s = sub.trim_start_matches(|c| c == '=' || c == ':' || c == ' ');
+                if let Some(token) = s.split_whitespace().next() {
+                    if let Some((num, den)) = token.split_once('/') {
+                        if let (Ok(n), Ok(d)) = (num.parse::<f32>(), den.parse::<f32>()) {
+                            if d > 0.0 {
+                                cur_rssi = (-100.0 + (n / d) * 70.0).round() as i32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if trimmed.contains("WPA2") || trimmed.contains("802.11i") {
+            cur_has_wpa2 = true;
+        } else if trimmed.contains("WPA") {
+            cur_has_wpa = true;
         }
     }
-    let count = entries.len();
-    state.lock().unwrap_or_else(|e| e.into_inner()).ffe1_value = entries.join(",").into_bytes();
-    eprintln!("step: scan complete, {count} networks");
+
+    flush_cell(&mut entries, &mut cur_ssid, &mut cur_rssi, &mut cur_has_wpa2, &mut cur_has_wpa);
+
+    entries.sort_by(|a, b| b.rssi.cmp(&a.rssi));
+
+    entries
+        .into_iter()
+        .map(|e| format!("{},{},{}", hex::encode(e.ssid), e.auth, e.rssi))
+        .collect()
+}
+
+fn run_wifi_scan(state: &Arc<Mutex<GattState>>) {
+    // Ensure control interface directory exists for wpa_supplicant / wpa_cli
+    let _ = std::fs::create_dir_all("/var/run/wpa_supplicant");
+    let _ = std::process::Command::new("mkdir").args(["-p", "/var/run/wpa_supplicant"]).status();
+
+    // Ensure wlan0 is UP before scanning without wiping any existing IPv4 address!
+    if ifconfig_wlan0_ip().is_none() {
+        let _ = std::process::Command::new("ifconfig").args(["wlan0", "up"]).status();
+    }
+
+    // wpa_supplicant is already managing wlan0 (STA mode); ask it to
+    // trigger a scan and read cached results back.
+    let _ = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan"]).status();
+    
+    // Poll up to 6 times (up to ~5s) for wpa_cli scan results to be available
+    let mut entries: Vec<(String, i32, i32)> = Vec::new();
+    for _ in 0..6 {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        if let Ok(out) = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "scan_results"]).output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines().skip(1) {
+                // wpa_cli scan_results columns: bssid / frequency / signal level / flags / ssid
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() < 5 {
+                    continue;
+                }
+                let ssid = cols[4].trim();
+                if ssid.is_empty() {
+                    continue;
+                }
+                let rssi: i32 = cols[2].parse().unwrap_or(-100);
+                let flags = cols[3];
+                let auth = if flags.contains("WPA2") {
+                    7
+                } else if flags.contains("WPA") {
+                    5
+                } else {
+                    1
+                };
+                if let Some(existing) = entries.iter_mut().find(|(s, _, _)| s == ssid) {
+                    if rssi > existing.2 {
+                        existing.2 = rssi;
+                        existing.1 = auth;
+                    }
+                } else {
+                    entries.push((ssid.to_string(), auth, rssi));
+                }
+            }
+            if !entries.is_empty() {
+                break;
+            }
+        }
+    }
+
+    let result_entries: Vec<String> = if !entries.is_empty() {
+        // Sort by RSSI descending so strongest networks appear first
+        entries.sort_by(|a, b| b.2.cmp(&a.2));
+        entries
+            .into_iter()
+            .map(|(ssid, auth, rssi)| format!("{},{},{}", hex::encode(ssid), auth, rssi))
+            .collect()
+    } else {
+        // Fallback: If wpa_cli returned 0 entries (e.g. wpa_supplicant not ready or empty cache),
+        // parse iwlist wlan0 scan directly.
+        eprintln!("step: wpa_cli scan returned 0 entries, attempting iwlist wlan0 scan fallback");
+        if let Ok(iw_out) = std::process::Command::new("iwlist").args(["wlan0", "scan"]).output() {
+            let text = String::from_utf8_lossy(&iw_out.stdout);
+            parse_iwlist_scan(&text)
+        } else {
+            Vec::new()
+        }
+    };
+
+    let count = result_entries.len();
+    if count > 0 {
+        state.lock().unwrap_or_else(|e| e.into_inner()).ffe1_value = result_entries.join(",").into_bytes();
+        eprintln!("step: scan complete, {count} networks cached in FFE1");
+    } else {
+        eprintln!("step: scan complete, 0 networks found");
+    }
 }
 
 fn apply_wifi_credentials(ssid: &str, password: &str, auth: i32, state: &Arc<Mutex<GattState>>) {
@@ -743,7 +926,18 @@ fn apply_wifi_credentials(ssid: &str, password: &str, auth: i32, state: &Arc<Mut
     match std::fs::write("/data/userconfig/wpa_supplicant.conf", &conf) {
         Ok(()) => {
             eprintln!("step: wrote /data/userconfig/wpa_supplicant.conf, restarting wpa_supplicant");
-            let _ = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "reconfigure"]).status();
+            let rc = std::process::Command::new("wpa_cli").args(["-i", "wlan0", "reconfigure"]).status();
+            let need_start = match rc {
+                Ok(status) => !status.success(),
+                Err(_) => true,
+            };
+            if need_start {
+                eprintln!("step: wpa_cli reconfigure failed, starting wpa_supplicant daemon");
+                let _ = std::process::Command::new("killall").args(["-9", "wpa_supplicant"]).status();
+                let _ = std::process::Command::new("wpa_supplicant")
+                    .args(["-B", "-D", "nl80211", "-i", "wlan0", "-c", "/data/userconfig/wpa_supplicant.conf"])
+                    .status();
+            }
             set_status(state, ssid, auth, 1, None);
             write_wifi_status("connecting", ssid);
             poll_connection_result(state, ssid, auth);
@@ -776,6 +970,7 @@ fn poll_connection_result(state: &Arc<Mutex<GattState>>, ssid: &str, auth: i32) 
     // against however short that window actually is, without changing
     // anything about how fast wpa_supplicant itself can reassociate.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut dhcp_requested = false;
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(300));
         let wpa_state = std::process::Command::new("wpa_cli")
@@ -793,6 +988,13 @@ fn poll_connection_result(state: &Arc<Mutex<GattState>>, ssid: &str, auth: i32) 
                 write_wifi_status("connected", &ip);
                 set_display_page("nano3s");
                 return;
+            } else if !dhcp_requested {
+                eprintln!("step: wifi associated (wpa_state=COMPLETED), requesting DHCP lease via udhcpc");
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("killall -9 udhcpc 2>/dev/null; udhcpc -i wlan0 -b -p /var/run/udhcpc.wlan0.pid &")
+                    .status();
+                dhcp_requested = true;
             }
         }
     }
@@ -836,6 +1038,27 @@ fn event_loop(fd: i32, device_name: &str) {
     let mut conn_handle: Option<u16> = None;
     let mut mtu: usize = 23;
     let mut buf = [0u8; 1024];
+
+    // Background thread: pre-warm scan results immediately on startup and refresh every 20s
+    // while wlan0 is unconfigured; once wlan0 has an IP, exit ble_setup so advertising stops.
+    let scan_state = Arc::clone(&state);
+    let force_adv = std::env::var("BLE_SETUP_FORCE_ADVERTISE").as_deref() == Ok("1");
+    std::thread::spawn(move || {
+        run_wifi_scan(&scan_state);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            if let Some(ip) = ifconfig_wlan0_ip() {
+                if !force_adv {
+                    write_wifi_status("connected", &ip);
+                    restore_display_page_if_wifi_setup();
+                    eprintln!("step: wlan0 acquired IP ({ip}), exiting BLE setup advertiser");
+                    std::process::exit(0);
+                }
+            } else {
+                run_wifi_scan(&scan_state);
+            }
+        }
+    });
 
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -945,5 +1168,62 @@ fn event_loop(fd: i32, device_name: &str) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_iwlist_scan() {
+        let sample = r#"
+wlan0     Scan completed :
+          Cell 01 - Address: 00:11:22:33:44:55
+                    Channel:1
+                    Frequency:2.412 GHz (Channel 1)
+                    Quality=70/70  Signal level=-40 dBm  
+                    Encryption key:on
+                    ESSID:"TestNet_5G"
+                    IE: IEEE 802.11i/WPA2 Version 1
+          Cell 02 - Address: 00:11:22:33:44:56
+                    Channel:6
+                    Frequency:2.437 GHz (Channel 6)
+                    Quality=50/70  Signal level=-65 dBm  
+                    Encryption key:on
+                    ESSID:"TestNet_WPA"
+                    IE: WPA Version 1
+          Cell 03 - Address: 00:11:22:33:44:57
+                    Channel:11
+                    Frequency:2.462 GHz (Channel 11)
+                    Quality=40/70  Signal level=-75 dBm  
+                    Encryption key:off
+                    ESSID:"OpenNet"
+"#;
+        let res = parse_iwlist_scan(sample);
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0], format!("{},7,-40", hex::encode("TestNet_5G")));
+        assert_eq!(res[1], format!("{},5,-65", hex::encode("TestNet_WPA")));
+        assert_eq!(res[2], format!("{},1,-75", hex::encode("OpenNet")));
+    }
+
+    #[test]
+    fn test_restore_display_page_in_file() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("mujina_ble_fb_page_test_{}.txt", std::process::id()));
+        let path_str = path.to_string_lossy().into_owned();
+
+        std::fs::write(&path, "wifi-setup\n").unwrap();
+        assert!(restore_display_page_in_file(&path_str));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nano3s");
+
+        assert!(!restore_display_page_in_file(&path_str));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nano3s");
+
+        std::fs::write(&path, "plasma").unwrap();
+        assert!(!restore_display_page_in_file(&path_str));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "plasma");
+
+        let _ = std::fs::remove_file(&path);
     }
 }
