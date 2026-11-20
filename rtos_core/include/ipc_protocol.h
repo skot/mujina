@@ -47,6 +47,16 @@ enum {
 	 * REG_SS_LOG_TIMER=SS_TIMER_DEFAULT_VALUE (re-arms the window
 	 * timer). Fire-and-forget, 1-byte dummy payload. */
 	IPC_MSG_RESET_SPDLOG_RAW = 11,
+	/* Split JOB messages for payloads exceeding K_IPCMSG_MAX_CONTENT_LEN
+	 * (e.g. Ocean pool's ~554B coinbase + 8+ merkle branches, which a
+	 * single IPC_MSG_JOB can't carry -- see IPC_JOB_WIRE_HDR_LEN's
+	 * comment below). IPC_MSG_JOB_SPLIT_HEAD carries every ipc_job
+	 * field except the coinbase bytes themselves (merkles included, plus
+	 * the coinbase_len the receiver should expect); one or more
+	 * IPC_MSG_JOB_SPLIT_COINBASE messages then carry job_id + offset +
+	 * a coinbase chunk, reassembled by offset on receipt. */
+	IPC_MSG_JOB_SPLIT_HEAD     = 12,
+	IPC_MSG_JOB_SPLIT_COINBASE = 13,
 };
 
 struct ipc_job {
@@ -189,5 +199,19 @@ int ipc_job_pack(const struct ipc_job *job, uint8_t *buf, uint16_t buf_cap, uint
  * or truncated buffer, including a length that doesn't exactly match the
  * declared nmerkles/coinbase_len. */
 int ipc_job_unpack(const uint8_t *buf, uint16_t len, struct ipc_job *job);
+
+/* Packs/unpacks the IPC_MSG_JOB_SPLIT_HEAD payload: every ipc_job field
+ * except the coinbase bytes (coinbase_len still travels, so the receiver
+ * knows how much coinbase data to expect from the SPLIT_COINBASE
+ * messages that follow). */
+int ipc_job_split_head_pack(const struct ipc_job *job, uint8_t *buf, uint16_t buf_cap, uint16_t *out_len);
+int ipc_job_split_head_unpack(const uint8_t *buf, uint16_t len, struct ipc_job *job);
+
+/* Packs/unpacks one IPC_MSG_JOB_SPLIT_COINBASE chunk: job_id (to match
+ * against the pending SPLIT_HEAD) + offset + a slice of the coinbase. */
+int ipc_job_split_coinbase_pack(uint32_t job_id, uint16_t offset, const uint8_t *chunk,
+	uint16_t chunk_len, uint8_t *buf, uint16_t buf_cap, uint16_t *out_len);
+int ipc_job_split_coinbase_unpack(const uint8_t *buf, uint16_t len, uint32_t *out_job_id,
+	uint16_t *out_offset, const uint8_t **out_data, uint16_t *out_chunk_len);
 
 #endif
