@@ -27,6 +27,8 @@ const INFO_HTML: &str = include_str!("../../assets/info.html");
 /// separate from `/dashboard` since it's a standing control surface, not
 /// a telemetry view.
 const LED_HTML: &str = include_str!("../../assets/led.html");
+#[cfg(all(feature = "nano3s", target_os = "linux"))]
+const BLUETOOTH_HTML: &str = include_str!("../../assets/bluetooth.html");
 /// Pool configuration page (Stratum URL/worker/password), separate from
 /// `/dashboard` for the same reason `/led` is -- a standing config surface
 /// rather than a telemetry view.
@@ -86,7 +88,7 @@ fn push_capped(buf: &mut VecDeque<f64>, v: f64) {
 }
 
 pub fn routes() -> Router<SharedState> {
-    Router::new()
+    let router = Router::new()
         .route("/dashboard", routing::get(serve_page))
         .route("/data", routing::get(serve_data))
         .route("/info", routing::get(serve_info_page))
@@ -94,13 +96,30 @@ pub fn routes() -> Router<SharedState> {
         .route("/pool", routing::get(serve_pool_page))
         .route("/tuning", routing::get(serve_tuning_page))
         .route("/firmware", routing::get(serve_firmware_page))
+        .route("/device-page.css", routing::get(serve_device_page_css))
         .route("/nano3s-detail", routing::get(serve_nano3s_detail))
         .route("/mujina-head-mark.svg", routing::get(serve_logo_svg))
-        .route("/doom/launch", routing::post(launch_doom))
+        .route("/doom/launch", routing::post(launch_doom));
+    #[cfg(all(feature = "nano3s", target_os = "linux"))]
+    let router = router
+        .route("/bluetooth", routing::get(|| async { Html(BLUETOOTH_HTML) }))
+        .merge(super::bluetooth::routes());
+    router
 }
 
 async fn serve_page() -> impl IntoResponse {
-    Html(DASHBOARD_HTML)
+    #[cfg(all(feature = "nano3s", target_os = "linux"))]
+    static WITH_BLUETOOTH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        DASHBOARD_HTML.replace(
+            "<!-- nano3s-bluetooth-nav -->",
+            r#"<a class="navlink" href="/bluetooth">Bluetooth</a>"#,
+        )
+    });
+    #[cfg(all(feature = "nano3s", target_os = "linux"))]
+    let page = WITH_BLUETOOTH.as_str();
+    #[cfg(not(all(feature = "nano3s", target_os = "linux")))]
+    let page = DASHBOARD_HTML;
+    Html(page)
 }
 
 async fn serve_logo_svg() -> impl IntoResponse {
@@ -150,6 +169,16 @@ async fn serve_pool_page() -> impl IntoResponse {
 
 async fn serve_tuning_page() -> impl IntoResponse {
     Html(TUNING_HTML)
+}
+
+async fn serve_device_page_css() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("../../assets/device-page.css"),
+    )
 }
 
 async fn serve_firmware_page() -> impl IntoResponse {

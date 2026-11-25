@@ -303,14 +303,8 @@ fn device_name_suffix(fd: i32) -> String {
 }
 
 fn main() {
-    // Only advertise when wlan0 isn't already connected -- this is
-    // meant to run in a supervised restart loop from boot (see
-    // mujina_display_startup.sh), so once WiFi is configured this
-    // becomes a cheap periodic no-op rather than an always-on radio.
-    // Real vendor behavior (per nano3ble's own doc comment) stops BLE
-    // advertising ~90s after WiFi connects; this achieves the same
-    // effect more simply by never starting it in the first place once
-    // already connected, rechecked every 60s via the sleep+exit below.
+    // The startup supervisor owns hci0 after Wi-Fi provisioning.
+    // Return once Wi-Fi is ready so the audio services can start.
     let force_advertise = std::env::var("BLE_SETUP_FORCE_ADVERTISE").as_deref() == Ok("1");
     if !force_advertise && ifconfig_wlan0_ip().is_none() && has_configured_wifi() {
         eprintln!("step: wpa_supplicant.conf exists; waiting up to 15s for wlan0 IP before BLE setup");
@@ -324,8 +318,7 @@ fn main() {
     if let Some(ip) = ifconfig_wlan0_ip() {
         if !force_advertise {
             restore_display_page_if_wifi_setup();
-            eprintln!("step: wlan0 connected (ip={ip}), not advertising; idling before recheck");
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            eprintln!("step: wlan0 connected (ip={ip}), exiting BLE setup");
             return;
         } else {
             eprintln!("step: wlan0 connected (ip={ip}) but BLE_SETUP_FORCE_ADVERTISE=1; continuing BLE advertising");

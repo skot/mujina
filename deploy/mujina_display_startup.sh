@@ -9,6 +9,13 @@
 # script only supervises the Linux-side processes.
 APP=/mntapp/release/linux/app
 
+# Provisioning must start before waiting for Wi-Fi.
+if [ -r /opt/mujina-bluetooth-runtime.tar.gz ]; then
+    export MUJINA_BUNDLED_BLUETOOTH=1
+    export DBUS_SYSTEM_BUS_ADDRESS=unix:path=/tmp/mujina-bluetooth/dbus/system_bus_socket
+fi
+$APP/mujina_bluetooth_startup.sh > /tmp/mujina-bluetooth-startup.log 2>&1 &
+
 # Wait for wlan0 to have an address before trying to reach the pool --
 # up to 60s, matching this project's other network-dependent bringup
 # scripts.

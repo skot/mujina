@@ -54,6 +54,7 @@ io-kit-sys = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = { workspace = true }
 udev = { workspace = true }
+zbus = { version = "5.19", default-features = false, features = ["tokio"], optional = true }
 
 [[bin]]
 name = "mujina-minerd"
@@ -95,7 +96,7 @@ skip-pty-tests = []  # Skip PTY-based serial tests that may hang in some environ
 # a riscv64 static archive -- enabling this on a native (non-riscv64)
 # build would fail to link. Only pass --features nano3s when
 # cross-compiling for riscv64gc-unknown-linux-gnu for the actual device.
-nano3s = []
+nano3s = ["dep:zbus"]
 
 [build-dependencies]
 cc = "1"

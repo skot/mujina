@@ -5,6 +5,8 @@
 //! require authentication for local access.
 
 pub mod commands;
+#[cfg(all(feature = "nano3s", target_os = "linux"))]
+mod bluetooth;
 mod dashboard;
 mod registry;
 mod server;

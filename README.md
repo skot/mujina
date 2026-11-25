@@ -137,6 +137,34 @@ This updates both `mujina-minerd` and the fan/power harness in a
 single reboot and keeps everything else as-is -- WiFi, pool config,
 fan curve. No USB cable, no burning tool, no BLE re-setup.
 
+#### Bluetooth speakers
+
+Open **Bluetooth** in the Nano3S dashboard. Put the speaker in pairing mode,
+select **Scan**, then select **Pair** beside the speaker. Use **Connect** for a
+paired speaker that is disconnected.
+
+In **MP3 playback**, upload an MP3 up to 12 MiB, select a connected speaker, and
+press **Play**. The miner holds one track until restart.
+
+The Linux image needs D-Bus with its system bus configuration, BlueZ with
+Classic Bluetooth and A2DP enabled, BlueALSA with its D-Bus policy and ALSA
+PCM plug-in, `mpg123`, and ALSA's `aplay`.
+Keep the adapter in dual or BR/EDR mode and run a single BlueZ instance.
+`deploy/mujina_bluetooth_startup.sh` starts BlueZ and the BlueALSA A2DP source
+after the Wi-Fi setup process exits. Install both Bluetooth startup scripts
+next to `mujina_display_startup.sh` in `/mntapp/release/linux/app/`.
+
+On a lean image, an optional RISC-V userspace archive at
+`/opt/mujina-bluetooth-runtime.tar.gz` enables the packaged runtime. It needs
+those same tools and libraries, including `libgcc_s.so.1` for ALSA thread
+cleanup. Install the two configs from `deploy/bluetooth/` as
+`/etc/mujina-dbus.conf` and `/etc/bluetooth/mujina.conf` inside the archive. The
+packaged entry points and mount points are in
+`deploy/mujina_bluetooth_runtime.sh`. Pairings in this mode live under
+`/data/userconfig/bluetooth`. The usual two-binary firmware bundle carries
+the miner and fan harness. Deploy the audio runtime and startup scripts
+alongside it when upgrading an existing device.
+
 ### Build From Source
 
 The rest of this section covers building both firmwares yourself and

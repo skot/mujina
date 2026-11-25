@@ -15,11 +15,11 @@
 #
 # What this pushes:
 #   - rtos_core.elf + tools/init.sh          -> /sharefs/
-#   - mujina-minerd                          -> /data/
+#   - mujina-minerd and ble_setup            -> /data/
 #   - wdt_disable_hold, mujina_test_harness  -> built fresh from source
 #     (rebuilding here, not committing binaries, matches how rtos_core.elf
 #     and mujina-minerd are already handled)
-#   - hardware_bringup.sh, mujina_display_startup.sh (from deploy/)
+#   - hardware_bringup.sh and the supervisors from deploy/
 #                                             -> /mntapp/release/linux/app/
 #   - tools/rcS                              -> /etc/init.d/rcS (backed up
 #     first)
@@ -48,7 +48,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RTOS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_ROOT="$(cd "$RTOS_ROOT/.." && pwd)"
 RTOS_ELF="$RTOS_ROOT/build/rtos_core.elf"
-MUJINA_MINERD="$PROJECT_ROOT/mujina-upstream/target/riscv64gc-unknown-linux-gnu/release/mujina-minerd.stripped"
+LINUX_BIN="$PROJECT_ROOT/target/riscv64gc-unknown-linux-gnu/release"
+MUJINA_MINERD="$LINUX_BIN/mujina-minerd.stripped"
+BLE_SETUP="$LINUX_BIN/ble_setup.stripped"
 SSH="ssh -o StrictHostKeyChecking=no root@$DEVICE_IP"
 SCP="scp -o StrictHostKeyChecking=no"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -64,8 +66,10 @@ if $SSH "grep -q mujina_display_startup.sh /etc/init.d/rcS" 2>/dev/null; then
     exit 1
 fi
 
-for f in "$RTOS_ELF" "$MUJINA_MINERD" "$SCRIPT_DIR/rcS" "$SCRIPT_DIR/init.sh" \
-         "$SCRIPT_DIR/hardware_bringup.sh" "$PROJECT_ROOT/deploy/mujina_display_startup.sh"; do
+for f in "$RTOS_ELF" "$MUJINA_MINERD" "$BLE_SETUP" "$SCRIPT_DIR/rcS" "$SCRIPT_DIR/init.sh" \
+         "$SCRIPT_DIR/hardware_bringup.sh" "$PROJECT_ROOT/deploy/mujina_display_startup.sh" \
+         "$PROJECT_ROOT/deploy/mujina_bluetooth_startup.sh" \
+         "$PROJECT_ROOT/deploy/mujina_bluetooth_runtime.sh"; do
     [ -f "$f" ] || { echo "[!] Missing required local file: $f"; exit 1; }
 done
 
@@ -91,10 +95,14 @@ $SSH "chmod +x /sharefs/rtos_core.elf.new /sharefs/init.sh.new && mv /sharefs/rt
 echo "[*] Pushing mujina-minerd..."
 $SCP "$MUJINA_MINERD" "root@$DEVICE_IP:/data/mujina-minerd.new"
 $SSH "chmod +x /data/mujina-minerd.new && mv /data/mujina-minerd.new /data/mujina-minerd"
+$SCP "$BLE_SETUP" "root@$DEVICE_IP:/data/ble_setup.new"
+$SSH "chmod +x /data/ble_setup.new && mv /data/ble_setup.new /data/ble_setup"
 
 echo "[*] Pushing app/ binaries and scripts..."
 for f in "$BUILD_DIR/wdt_disable_hold" "$BUILD_DIR/mujina_test_harness" \
-         "$SCRIPT_DIR/hardware_bringup.sh" "$PROJECT_ROOT/deploy/mujina_display_startup.sh"; do
+         "$SCRIPT_DIR/hardware_bringup.sh" "$PROJECT_ROOT/deploy/mujina_display_startup.sh" \
+         "$PROJECT_ROOT/deploy/mujina_bluetooth_startup.sh" \
+         "$PROJECT_ROOT/deploy/mujina_bluetooth_runtime.sh"; do
     name="$(basename "$f")"
     $SCP "$f" "root@$DEVICE_IP:/mntapp/release/linux/app/$name.new"
     $SSH "chmod +x /mntapp/release/linux/app/$name.new && mv /mntapp/release/linux/app/$name.new /mntapp/release/linux/app/$name"

@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MUJINA // BLUETOOTH</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/device-page.css">
+<style>
+  .speaker-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .speaker-controls .hint { color: var(--ink); margin: 0; }
+  .speaker-list { list-style: none; margin: 0; padding: 0; }
+  .speaker-list li {
+    display: flex; align-items: center; justify-content: space-between; gap: 14px;
+    border-top: 1px solid var(--line); padding: 12px 0;
+  }
+  .speaker-list li:first-child { margin-top: 12px; }
+  .speaker-list li:last-child { padding-bottom: 0; }
+  .speaker-list div { min-width: 0; overflow-wrap: anywhere; }
+  .speaker-list small { display: block; margin-top: 4px; color: var(--ink); opacity: .75; }
+  .speaker-list .btn, .speaker-controls .btn { flex: none; min-height: 44px; }
+  .speaker-controls .btn { color: var(--cyan); border-color: var(--cyan); }
+  .speaker-list .btn:focus-visible, .speaker-controls .btn:focus-visible, nav a:focus-visible {
+    outline: 2px solid var(--cyan); outline-offset: 3px;
+  }
+  #status:empty { margin: 0; }
+  .player { margin-top: 24px; }
+  .track-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .track-file, .speaker-select {
+    min-height: 44px; min-width: 0; max-width: 100%; padding: 8px;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 4px;
+    color: var(--ink); font: inherit;
+  }
+  .track-file { flex: 1 1 220px; }
+  .track-info { margin: 16px 0 8px; overflow-wrap: anywhere; }
+  .speaker-select { flex: 1 1 180px; }
+  .player-status { color: var(--ink); }
+  .player-status.err { color: var(--red); }
+  .player-status:empty { margin: 0; }
+  @media (max-width: 480px) {
+    .speaker-list li { gap: 8px; }
+    .speaker-list .btn { padding-inline: 12px; }
+  }
+  body.theme-minimal #status.err { color: #a2283a; }
+  body.theme-parasite #status.err { color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1><span class="chev">//</span>MUJINA <span style="color:var(--dim);font-weight:400">/ BLUETOOTH</span></h1>
+    <div style="display:flex;align-items:center;gap:18px">
+      <div class="status-strip"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
+      <nav class="nav" aria-label="Main Menu">
+        <a href="/dashboard">Dashboard</a>
+        <a href="/info">Info</a>
+        <a href="/led">LED</a>
+        <a href="/pool">Pool</a>
+        <a href="/tuning">Tuning</a>
+        <a href="/bluetooth" class="active" aria-current="page">Bluetooth</a>
+        <a href="/firmware">Firmware</a>
+      </nav>
+    </div>
+  </div>
+
+  <main aria-labelledby="speakers-heading">
+    <h2 class="sec" id="speakers-heading">Speakers</h2>
+    <div class="card">
+      <div class="speaker-controls">
+        <p class="hint">Put your speaker in pairing mode before scanning.</p>
+        <button class="btn" id="scan" type="button">Scan</button>
+      </div>
+      <p class="msg" id="status" role="status">Loading speakers…</p>
+      <ul class="speaker-list" id="speakers" aria-label="Bluetooth speakers"></ul>
+    </div>
+    <section class="player" aria-labelledby="player-heading">
+      <h2 class="sec" id="player-heading">MP3 playback</h2>
+      <div class="card">
+        <p class="hint" id="track-hint">Upload one MP3 up to 12 MiB. The file is cleared when the miner restarts.</p>
+        <form class="track-row" id="track-form">
+          <input class="track-file" id="track-file" type="file" accept=".mp3,audio/mpeg"
+                 aria-label="Choose MP3 file" aria-describedby="track-hint">
+          <button class="btn" id="track-upload" type="submit" disabled>Upload</button>
+        </form>
+        <p class="track-info" id="track-name">No MP3 loaded</p>
+        <div class="track-row">
+          <select class="speaker-select" id="track-speaker" aria-label="Playback speaker"></select>
+          <button class="btn" id="track-play" type="button" disabled>Play</button>
+          <button class="btn" id="track-stop" type="button" disabled>Stop</button>
+        </div>
+        <p class="msg player-status" id="player-status" role="status"></p>
+      </div>
+    </section>
+  </main>
+</div>
+  <script>
+    const scan = document.getElementById('scan');
+    const notice = document.getElementById('status');
+    const list = document.getElementById('speakers');
+    let speakers = [];
+    let busy = false;
+    const fileInput = document.getElementById('track-file');
+    const uploadButton = document.getElementById('track-upload');
+    const speakerSelect = document.getElementById('track-speaker');
+    const playButton = document.getElementById('track-play');
+    const stopButton = document.getElementById('track-stop');
+    const trackName = document.getElementById('track-name');
+    const playbackNotice = document.getElementById('player-status');
+    let track = {name: null, playing: false, error: null};
+    let playerBusy = false;
+    let playerMessage = '';
+    let playerError = false;
+
+    function renderPlayer() {
+      fileInput.disabled = playerBusy || track.playing;
+      uploadButton.disabled = fileInput.disabled || !fileInput.files.length;
+      speakerSelect.disabled = playerBusy || track.playing || !speakerSelect.value;
+      playButton.disabled = playerBusy || track.playing || !track.name || !speakerSelect.value;
+      stopButton.disabled = playerBusy || !track.playing;
+      trackName.textContent = track.name || 'No MP3 loaded';
+      playbackNotice.classList.toggle('err', playerError || (!playerMessage && !!track.error));
+      playbackNotice.textContent = playerMessage || track.error || (track.playing ? 'Playing…' : '');
+    }
+
+    function renderPlayerSpeakers() {
+      const selected = speakerSelect.value;
+      const connected = speakers.filter(speaker => speaker.connected);
+      speakerSelect.replaceChildren();
+      for (const speaker of connected) speakerSelect.add(new Option(speaker.name, speaker.address));
+      if (connected.some(speaker => speaker.address === selected)) speakerSelect.value = selected;
+      if (!connected.length) speakerSelect.add(new Option('Connect a speaker to play', ''));
+      renderPlayer();
+    }
+
+    async function playerRequest(endpoint, options) {
+      const response = await fetch('/bluetooth/' + endpoint, options);
+      const data = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(data?.error || (response.status === 401 ? 'API token required.' : 'MP3 request failed.'));
+      return data;
+    }
+
+    async function playerAction(endpoint, options, message) {
+      if (playerBusy) return;
+      playerBusy = true;
+      playerMessage = message;
+      playerError = false;
+      renderPlayer();
+      try {
+        track = await playerRequest(endpoint, options);
+        if (options.method === 'PUT') fileInput.value = '';
+        playerMessage = '';
+      } catch (error) {
+        playerMessage = error.message;
+        playerError = true;
+      } finally {
+        playerBusy = false;
+        renderPlayer();
+      }
+    }
+
+    async function refreshPlayer() {
+      if (playerBusy || document.hidden) return;
+      try {
+        const current = await playerRequest('track');
+        if (!playerBusy) {
+          track = current;
+          renderPlayer();
+        }
+      } catch (_) { /* The next poll can recover if the miner is restarting. */ }
+    }
+
+    document.getElementById('track-form').addEventListener('submit', event => {
+      event.preventDefault();
+      const file = fileInput.files[0];
+      if (!file) return;
+      if (file.size > 12 * 1024 * 1024) {
+        playerMessage = 'Choose an MP3 up to 12 MiB.';
+        playerError = true;
+        renderPlayer();
+        return;
+      }
+      playerAction('track?' + new URLSearchParams({name: file.name}), {
+        method: 'PUT', headers: {'Content-Type': 'audio/mpeg'}, body: file,
+      }, 'Uploading MP3…');
+    });
+    fileInput.addEventListener('change', () => {
+      playerMessage = '';
+      playerError = false;
+      renderPlayer();
+    });
+    speakerSelect.addEventListener('change', renderPlayer);
+    playButton.addEventListener('click', () => playerAction('play', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({address: speakerSelect.value}),
+    }, 'Starting playback…'));
+    stopButton.addEventListener('click', () => playerAction('stop', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+    }, 'Stopping playback…'));
+
+    function render() {
+      scan.disabled = busy;
+      list.replaceChildren();
+      for (const speaker of speakers) {
+        const row = document.createElement('li');
+        const details = document.createElement('div');
+        const name = document.createElement('strong');
+        name.textContent = speaker.name;
+        const state = document.createElement('small');
+        const connection = speaker.connected ? 'Connected' : speaker.paired ? 'Paired' : 'Ready to pair';
+        state.textContent = `${speaker.address} · ${connection}`;
+        details.append(name, state);
+        row.append(details);
+        if (!speaker.connected) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'btn';
+          const label = speaker.paired ? 'Connect' : 'Pair';
+          button.textContent = label;
+          button.setAttribute('aria-label', `${label} ${speaker.name}`);
+          button.disabled = busy;
+          button.addEventListener('click', () => update(label.toLowerCase(), speaker));
+          row.append(button);
+        }
+        list.append(row);
+      }
+      renderPlayerSpeakers();
+    }
+
+    async function update(action, speaker) {
+      if (busy) return;
+      busy = true;
+      notice.className = 'msg';
+      notice.textContent = {
+        scan: 'Scanning for speakers…',
+        pair: `Pairing with ${speaker?.name}…`,
+        connect: `Connecting to ${speaker?.name}…`,
+        speakers: 'Loading speakers…',
+      }[action];
+      render();
+      try {
+        const request = action === 'speakers' ? {} : {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(speaker ? {address: speaker.address} : {}),
+        };
+        const response = await fetch(`/bluetooth/${action}`, request);
+        const result = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(result?.error || (response.status === 401 ? 'API token required.' : 'Bluetooth request failed.'));
+        speakers = result;
+        notice.textContent = action === 'scan' && !speakers.length ? 'No speakers found.' : '';
+      } catch (error) {
+        notice.className = 'msg err';
+        notice.textContent = error.message;
+      } finally {
+        busy = false;
+        render();
+      }
+    }
+
+    async function checkConnection() {
+      const connected = await fetch('/api/v0/health', {cache: 'no-store'})
+        .then(response => response.ok, () => false);
+      document.getElementById('connDot').className = connected ? 'dot ok' : 'dot bad';
+      document.getElementById('connText').textContent = connected ? 'live' : 'unreachable';
+    }
+
+    checkConnection();
+    setInterval(checkConnection, 5000);
+    refreshPlayer();
+    setInterval(refreshPlayer, 2000);
+    scan.addEventListener('click', () => update('scan'));
+    update('speakers');
+  </script>
+</body>
+</html>
