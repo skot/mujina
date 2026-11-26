@@ -13,22 +13,27 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
-    io::AsyncWriteExt,
-    process::{Child, Command},
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
-    time::timeout,
+    time::{Instant, sleep_until, timeout},
 };
+use tokio_util::task::AbortOnDropHandle;
 
 use super::{
     ApiError, ApiResult, SpeakerRequest, audio_bus, error, selected_speaker, valid_address,
 };
 use crate::api::server::SharedState;
+use crate::board::nano3s::vu_meter::{self, PcmMeter, SAMPLE_RATE};
 
 const ROOT: &str = "/tmp/mujina-bluetooth/root";
 const TRACK: &str = "/tmp/mujina-track.mp3";
 const UPLOAD: &str = "/tmp/mujina-track.part";
 const ALSA_CONFIG: &str = "/tmp/mujina-playback.conf";
-const PCM_RATE: &str = "48000";
+const PCM_INTERVAL: Duration = Duration::from_millis(20);
+const PCM_CHUNK: usize = (SAMPLE_RATE as usize / 50) * 4;
+// Allow for ALSA's start threshold and buffering in the Bluetooth speaker.
+const METER_DELAY_CHUNKS: usize = 8;
 // Leave room in the board's tmpfs for the old track and a replacement.
 const MAX_UPLOAD: usize = 12 * 1024 * 1024;
 const PLAYER_FAILED: &str = "Playback ended unexpectedly. Check the speaker connection.";
@@ -42,6 +47,7 @@ static PLAYER: Mutex<Player> = Mutex::const_new(Player {
 struct Playback {
     decoder: Child,
     output: Child,
+    pump: AbortOnDropHandle<()>,
 }
 
 struct Player {
@@ -67,6 +73,10 @@ struct StopRequest {}
 
 pub(super) fn routes() -> Router<SharedState> {
     Router::new()
+        .route(
+            "/bluetooth/level",
+            routing::get(|| async { Json(vu_meter::bars()) }),
+        )
         .route("/bluetooth/track", routing::get(track_status).put(upload))
         .route("/bluetooth/play", routing::post(play))
         .route("/bluetooth/stop", routing::post(stop))
@@ -307,18 +317,18 @@ async fn start_playback(address: &str) -> io::Result<Playback> {
          }}\n",
     );
     fs::write(host_path(ALSA_CONFIG), config).await?;
-    // Play raw PCM so ALSA can stream to EOF without a seekable WAV header.
+    let rate = SAMPLE_RATE.to_string();
+    // Raw PCM streams to EOF and lets the LED meter read the same samples.
     let mut decoder = audio_command("mpg123", "/usr/bin/mpg123.bin")
-        .args(["-q", "-r", PCM_RATE, "--stereo", "--encoding", "s16", "-s"])
+        .args(["-q", "-r", &rate, "--stereo", "--encoding", "s16", "-s"])
         .arg(runtime_path(TRACK))
         .stdout(Stdio::piped())
         .spawn()?;
-    let pipe: Stdio = decoder
+    let pcm = decoder
         .stdout
         .take()
-        .ok_or_else(|| io::Error::other("No audio pipe"))?
-        .try_into()?;
-    let output = audio_command("aplay", "/usr/bin/aplay")
+        .ok_or_else(|| io::Error::other("No decoder audio pipe"))?;
+    let mut output = audio_command("aplay", "/usr/bin/aplay")
         .env("ALSA_CONFIG_PATH", runtime_path(ALSA_CONFIG))
         .args([
             "-q",
@@ -329,19 +339,83 @@ async fn start_playback(address: &str) -> io::Result<Playback> {
             "-f",
             "S16_LE",
             "-r",
-            PCM_RATE,
+            &rate,
             "-c",
             "2",
+            "--buffer-time=150000",
+            "--period-time=30000",
+            "--start-delay=-90000",
             "-",
         ])
-        .stdin(pipe)
+        .stdin(Stdio::piped())
         .spawn()?;
-    Ok(Playback { decoder, output })
+    let sink = output
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("No playback audio pipe"))?;
+    let meter = PcmMeter::start();
+    let pump = AbortOnDropHandle::new(tokio::spawn(async move {
+        if let Err(err) = stream_pcm(pcm, sink, meter).await {
+            tracing::debug!(error = %err, "MP3 audio pipe closed");
+        }
+    }));
+    Ok(Playback {
+        decoder,
+        output,
+        pump,
+    })
+}
+
+async fn stream_pcm(
+    mut pcm: ChildStdout,
+    mut sink: ChildStdin,
+    mut meter: PcmMeter,
+) -> io::Result<()> {
+    let mut chunk = [0; PCM_CHUNK];
+    let mut metered = [0.0; METER_DELAY_CHUNKS];
+    let mut cursor = 0;
+    let mut deadline = Instant::now();
+
+    loop {
+        let mut len = 0;
+        while len < chunk.len() {
+            let n = pcm.read(&mut chunk[len..]).await?;
+            if n == 0 {
+                break;
+            }
+            len += n;
+        }
+        if len == 0 {
+            break;
+        }
+        // Pace input at the audio rate so a full pipe cannot run the LEDs
+        // hundreds of milliseconds ahead of the speaker.
+        sleep_until(deadline).await;
+        sink.write_all(&chunk[..len]).await?;
+        meter.publish(metered[cursor]);
+        metered[cursor] = meter.measure(&chunk[..len]);
+        cursor = (cursor + 1) % metered.len();
+        deadline += PCM_INTERVAL;
+        if deadline + PCM_INTERVAL * 4 < Instant::now() {
+            deadline = Instant::now();
+        }
+    }
+    sink.shutdown().await?;
+    drop(sink);
+    for _ in 0..metered.len() {
+        sleep_until(deadline).await;
+        meter.publish(metered[cursor]);
+        cursor = (cursor + 1) % metered.len();
+        deadline += PCM_INTERVAL;
+    }
+    sleep_until(deadline).await;
+    Ok(())
 }
 
 async fn stop(Json(_): Json<StopRequest>) -> ApiResult<TrackStatus> {
     let mut player = PLAYER.try_lock().map_err(|_| player_busy())?;
     if let Some(mut playback) = player.playback.take() {
+        playback.pump.abort();
         let _ = tokio::join!(playback.decoder.kill(), playback.output.kill());
     }
     player.playback_error = None;

@@ -307,7 +307,7 @@ pub struct BoardPauseRequest {
 /// is one of `"auto"` (default; automatic status indication), `"off"`,
 /// `"solid"`, `"rainbow"`, `"colorloop"`, `"breathe"`, `"blink"`,
 /// `"chase"`, `"chase_rainbow"`, `"scanner"`, `"twinkle"`, or
-/// `"fire_flicker"` -- see `board::nano3s::LedEffect` for what each does.
+/// `"fire_flicker"`, `"vu_meter"` -- see `board::nano3s::LedEffect` for what each does.
 /// Not every effect uses every field (e.g. `"rainbow"` ignores `color`).
 /// Any field left unset keeps its current value -- e.g. a
 /// `brightness`-only request doesn't reset `effect`. `color` is a

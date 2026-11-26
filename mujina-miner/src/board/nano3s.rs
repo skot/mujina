@@ -32,6 +32,8 @@
 //! - version/ntime/nbits are stored as plain native (little-endian on
 //!   this riscv64 target) `u32` words, no swap.
 
+pub(crate) mod vu_meter;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1790,6 +1792,8 @@ enum LedEffect {
     /// jitters brightness and hue within a red/orange/amber range.
     /// Ignores `color` -- always warm.
     FireFlicker,
+    /// A green, amber, and red meter for the playing MP3.
+    VuMeter,
 }
 
 impl LedEffect {
@@ -1807,6 +1811,7 @@ impl LedEffect {
             LedEffect::Scanner => "scanner",
             LedEffect::Twinkle => "twinkle",
             LedEffect::FireFlicker => "fire_flicker",
+            LedEffect::VuMeter => "vu_meter",
         }
     }
 
@@ -1824,8 +1829,9 @@ impl LedEffect {
             "scanner" => Ok(LedEffect::Scanner),
             "twinkle" => Ok(LedEffect::Twinkle),
             "fire_flicker" => Ok(LedEffect::FireFlicker),
+            "vu_meter" => Ok(LedEffect::VuMeter),
             other => Err(format!(
-                "unknown LED effect '{other}' (want auto/off/solid/rainbow/colorloop/breathe/blink/chase/chase_rainbow/scanner/twinkle/fire_flicker)"
+                "unknown LED effect '{other}' (want auto/off/solid/rainbow/colorloop/breathe/blink/chase/chase_rainbow/scanner/twinkle/fire_flicker/vu_meter)"
             )),
         }
     }
@@ -1938,6 +1944,20 @@ fn rainbow_frame(phase_deg: f32, brightness: u8) -> [(u8, u8, u8); WS2812_LED_CO
 fn scale_color(rgb: (u8, u8, u8), level: f32) -> (u8, u8, u8) {
     let level = level.clamp(0.0, 1.0);
     ((rgb.0 as f32 * level).round() as u8, (rgb.1 as f32 * level).round() as u8, (rgb.2 as f32 * level).round() as u8)
+}
+
+fn vu_frame(bars: f32, brightness: u8) -> [(u8, u8, u8); WS2812_LED_COUNT] {
+    std::array::from_fn(|index| {
+        // The strip's first hardware index is the rightmost LED.
+        let column = WS2812_LED_COUNT - 1 - index;
+        let color = match column {
+            0..=4 => (0, 224, 28),
+            5..=7 => (255, 170, 0),
+            _ => (255, 35, 0),
+        };
+        let fill = (bars - column as f32).clamp(0.0, 1.0);
+        scale_color(color, fill * brightness as f32 / 255.0)
+    })
 }
 
 /// Tiny xorshift32 PRNG for Twinkle/FireFlicker's per-pixel randomness --
@@ -2100,6 +2120,7 @@ impl AnimState {
                 }
                 colors
             }
+            LedEffect::VuMeter => vu_frame(vu_meter::bars(), ov.brightness),
             LedEffect::FireFlicker => {
                 // Always warm (deep red -> orange -> amber), ignoring
                 // `ov.color` entirely -- `color` persists across effect
@@ -3210,6 +3231,19 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vu_meter_fills_from_left_with_a_dimmed_leading_led() {
+        assert_eq!(LedEffect::parse("vu_meter"), Ok(LedEffect::VuMeter));
+        assert_eq!(LedEffect::VuMeter.as_str(), "vu_meter");
+        assert_eq!(vu_frame(0.0, 255), [(0, 0, 0); WS2812_LED_COUNT]);
+        let partial = vu_frame(6.5, 255);
+        assert_eq!(partial[8], (0, 224, 28));
+        assert_eq!(partial[3], (255, 170, 0));
+        assert_eq!(partial[2], (128, 85, 0));
+        assert_eq!(partial[1], (0, 0, 0));
+        assert_eq!(vu_frame(9.0, 128)[0], (128, 18, 0));
+    }
 
     #[test]
     fn led_fade_blends_and_settles_at_the_target_color() {

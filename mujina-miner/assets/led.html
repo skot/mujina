@@ -145,6 +145,8 @@ function $(id) { return document.getElementById(id); }
 
 let BOARD = null;
 let STATE = { effect: 'auto', color: '#ff0000', brightness: 128, speed: 128 };
+let vuBars = 0;
+let vuRequest = false;
 let DRAGGING = false;
 
 // Effect catalog. `needsColor`/`needsSpeed` drive which controls are
@@ -162,6 +164,7 @@ const EFFECTS = [
   { key: 'scanner',        label: 'Scanner',       needsColor: true,  needsSpeed: true,  desc: 'Single LED with a soft tail, bouncing end to end (Cylon eye).' },
   { key: 'twinkle',        label: 'Twinkle',       needsColor: true,  needsSpeed: true,  desc: 'Random LEDs flash and fade.' },
   { key: 'fire_flicker',   label: 'Fire Flicker',  needsColor: false, needsSpeed: true,  desc: 'Warm flicker across red/orange/amber. Ignores your color pick -- always warm.' },
+  { key: 'vu_meter',       label: 'VU Meter',      needsColor: false, needsSpeed: false, desc: 'Shows the MP3 playback level in green, amber, and red.' },
 ];
 const EFFECT_MAP = Object.fromEntries(EFFECTS.map(e => [e.key, e]));
 
@@ -377,6 +380,7 @@ function wireSliders() {
 }
 
 function setEffect(e, send) {
+  if (e !== STATE.effect) vuBars = 0;
   STATE.effect = e;
   applyEffectUi();
   if (send !== false) pushState();
@@ -471,6 +475,12 @@ function updatePreview() {
       });
       break;
     }
+    case 'vu_meter':
+      colors = Array.from({ length: 9 }, (_, i) => {
+        const color = i < 5 ? '#00e01c' : i < 8 ? '#ffaa00' : '#ff2300';
+        return scaleHex(color, v * Math.max(0, Math.min(1, vuBars - i)));
+      });
+      break;
     case 'fire_flicker': {
       colors = P.fire.map((f, i) => {
         const jitter = 0.55 + Math.random() * 0.45;
@@ -489,6 +499,20 @@ function updatePreview() {
     el.style.background = colors[i];
     el.classList.toggle('lit', colors[i] !== '#000' && colors[i] !== '#000000');
   });
+}
+
+async function pollVu() {
+  if (STATE.effect !== 'vu_meter' || document.hidden || vuRequest) return;
+  vuRequest = true;
+  try {
+    const response = await fetch('/bluetooth/level', { cache: 'no-store' });
+    const bars = response.ok ? await response.json() : 0;
+    if (STATE.effect === 'vu_meter') vuBars = bars;
+  } catch (_) {
+    vuBars = 0;
+  } finally {
+    vuRequest = false;
+  }
 }
 
 async function findBoard() {
@@ -516,6 +540,7 @@ async function pollState() {
     }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
+    if (d.effect !== STATE.effect) vuBars = 0;
     STATE = d;
     $('connDot').className = 'dot ok';
     $('connText').textContent = 'live · ' + BOARD;
@@ -534,6 +559,7 @@ bodyShell();
 pollState();
 setInterval(pollState, 3000);
 setInterval(updatePreview, 100);
+setInterval(pollVu, 125);
 </script>
 </body>
 </html>
